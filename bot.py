@@ -38,6 +38,11 @@ def _clean_openai_key(value):
 TOKEN=_clean_secret(os.getenv('TELEGRAM_BOT_TOKEN',''))
 OPENAI_API_KEY=_clean_openai_key(os.getenv('OPENAI_API_KEY',''))
 OPENAI_MODEL=(os.getenv('OPENAI_MODEL','') or '').strip()
+GROQ_API_KEY=_clean_secret(os.getenv('GROQ_API_KEY',''))
+GROQ_MODEL=(os.getenv('GROQ_MODEL','openai/gpt-oss-120b') or 'openai/gpt-oss-120b').strip()
+AI_PROVIDER=(os.getenv('AI_PROVIDER','') or '').strip().lower()
+if not AI_PROVIDER:
+    AI_PROVIDER='groq' if GROQ_API_KEY else 'openai'
 GDRIVE_UPLOAD_URL=(os.getenv('GDRIVE_UPLOAD_URL','') or '').strip()
 GDRIVE_UPLOAD_SECRET=_clean_secret(os.getenv('GDRIVE_UPLOAD_SECRET',''))
 DB_PATH=Path(os.getenv('DB_PATH',str(BASE_DIR/'data'/'ai_maturity.db'))); POLL_TIMEOUT=int(os.getenv('POLL_TIMEOUT','30'))
@@ -49,7 +54,7 @@ MODE_LABEL={'ai':'ШІ-аналіз','hybrid':'ШІ-аналіз з підкрі
 def _safe_log_text(value):
     # Never let credentials escape into Render logs.
     s=str(value or '')
-    secrets=[TOKEN,OPENAI_API_KEY,GDRIVE_UPLOAD_SECRET]
+    secrets=[TOKEN,OPENAI_API_KEY,GROQ_API_KEY,GDRIVE_UPLOAD_SECRET]
     for secret in secrets:
         if secret:
             s=s.replace(secret,'***REDACTED***')
@@ -140,7 +145,9 @@ async def configure_telegram_ui():
                 'AI Maturity Bot — дослідницький інформаційно-аналітичний інструмент '
                 'для комплексного оцінювання AI-зрілості органів публічної влади. '
                 'Автоматичний аналіз виконується на основі офіційного вебсайту та відкритих джерел. '
-                '© 2026, Антон Осьмак'
+                'Результат є лише експериментальною оцінкою в межах розробки та апробації методики '
+                'і не є офіційною оцінкою діяльності органу. /start — розпочати. '
+                '©2026, Антон Осьмак'
             )
         })
         print('Telegram command menu and descriptions configured',flush=True)
@@ -250,8 +257,17 @@ def _json_from_model_text(s):
         return json.loads(m.group(0))
 
 async def ai_assess(aid,organization,url):
-    if not OPENAI_API_KEY or not OPENAI_MODEL:
-        raise RuntimeError('Для ШІ-режиму потрібно задати OPENAI_API_KEY та OPENAI_MODEL у Render.')
+    provider=AI_PROVIDER
+    if provider=='groq':
+        if not GROQ_API_KEY:
+            raise RuntimeError('Для Groq потрібно задати GROQ_API_KEY у Render.')
+        model=GROQ_MODEL or 'openai/gpt-oss-120b'
+    elif provider=='openai':
+        if not OPENAI_API_KEY or not OPENAI_MODEL:
+            raise RuntimeError('Для OpenAI потрібно задати OPENAI_API_KEY та OPENAI_MODEL у Render.')
+        model=OPENAI_MODEL
+    else:
+        raise RuntimeError(f'Невідомий AI_PROVIDER: {provider}')
 
     # Official-site crawling is useful evidence, but it is no longer a hard dependency.
     # If the site blocks Render or returns no parseable text, the analysis continues
@@ -322,35 +338,48 @@ async def ai_assess(aid,organization,url):
 {official_excerpt}
 """.strip()
 
+    if provider=='groq':
+        api_key=GROQ_API_KEY
+        endpoint='https://api.groq.com/openai/v1/responses'
+        payload={
+            'model':model,
+            'input':prompt,
+            'tools':[{'type':'browser_search'}],
+            'tool_choice':'required',
+            'max_output_tokens':14000
+        }
+    else:
+        api_key=OPENAI_API_KEY
+        endpoint='https://api.openai.com/v1/responses'
+        payload={
+            'model':model,
+            'tools':[{
+                'type':'web_search',
+                'external_web_access':True,
+                'search_context_size':'high'
+            }],
+            'input':prompt,
+            'max_output_tokens':14000
+        }
+
     headers={
-        'Authorization':f'Bearer {OPENAI_API_KEY}',
+        'Authorization':f'Bearer {api_key}',
         'Content-Type':'application/json'
-    }
-    payload={
-        'model':OPENAI_MODEL,
-        'tools':[{
-            'type':'web_search',
-            'external_web_access':True,
-            'search_context_size':'high'
-        }],
-        'input':prompt,
-        'max_output_tokens':14000
     }
 
     try:
         async with httpx.AsyncClient(timeout=300,follow_redirects=True) as c:
-            resp=await c.post('https://api.openai.com/v1/responses',headers=headers,json=payload)
+            resp=await c.post(endpoint,headers=headers,json=payload)
     except Exception as e:
         safe=_safe_log_text(e)
-        print(f'OpenAI transport error: type={type(e).__name__} detail={safe}',flush=True)
-        raise RuntimeError('Помилка з’єднання з OpenAI API.') from None
+        print(f'{provider} transport error: type={type(e).__name__} detail={safe}',flush=True)
+        raise RuntimeError(f'Помилка з’єднання з AI-провайдером {provider}.') from None
 
     if resp.status_code>=400:
         body=_safe_log_text(resp.text[:2500])
         rid=resp.headers.get('x-request-id','')
-        print(f'OpenAI API error: status={resp.status_code} request_id={rid} body={body}',flush=True)
-        # Keep the user-facing exception generic; details remain in Render logs.
-        raise RuntimeError(f'OpenAI API повернув HTTP {resp.status_code}.')
+        print(f'{provider} API error: status={resp.status_code} request_id={rid} body={body}',flush=True)
+        raise RuntimeError(f'AI-провайдер {provider} повернув HTTP {resp.status_code}.')
     data=resp.json()
 
     model_text=_response_output_text(data)
@@ -403,6 +432,7 @@ async def ai_assess(aid,organization,url):
 
         note=(
             f"Метод: ШІ-аналіз офіційного вебсайту та відкритих джерел. "
+            f"AI-провайдер: {provider}; модель: {model}. "
             f"Автоматично прочитано сторінок офіційного сайту: {pages}. "
             f"{str(obj.get('research_note') or '').strip()}"
         ).strip()
@@ -492,18 +522,17 @@ def _fonts():
 
 def export_pdf(aid):
     a,ans,r=_payload(aid); out=BASE_DIR/'exports'/f'AI_Maturity_Assessment_{aid}.pdf'; out.parent.mkdir(parents=True,exist_ok=True); font,bold=_fonts(); st=getSampleStyleSheet(); st.add(ParagraphStyle(name='U',parent=st['BodyText'],fontName=font,fontSize=8.5,leading=11)); st.add(ParagraphStyle(name='H',parent=st['Heading2'],fontName=bold,fontSize=13)); st.add(ParagraphStyle(name='T',parent=st['Title'],fontName=bold,fontSize=17,alignment=TA_CENTER))
-    footer_text='AI Maturity Bot — дослідницький інформаційно-аналітичний інструмент для комплексного оцінювання AI-зрілості органів публічної влади. © Антон Осьмак · @AI_Maturity_Bot'
     def draw_footer(canvas,doc):
         canvas.saveState()
-        canvas.setFont(font,6.4)
-        width=A4[0]-24*mm
-        # Footer in two compact lines so it remains readable and does not collide with content.
-        line1='AI Maturity Bot — дослідницький інформаційно-аналітичний інструмент для комплексного оцінювання'
-        line2='AI-зрілості органів публічної влади. © 2026, Антон Осьмак · @AI_Maturity_Bot · ai.maturity.bot@gmail.com'
-        canvas.drawCentredString(A4[0]/2,8.0*mm,line1)
-        canvas.drawCentredString(A4[0]/2,5.0*mm,line2)
+        canvas.setFont(font,6.1)
+        line1='AI Maturity Bot — дослідницький інформаційно-аналітичний інструмент для комплексного оцінювання AI-зрілості органів публічної влади.'
+        line2='Результат є лише експериментальною оцінкою в межах розробки та апробації методики та не є офіційною оцінкою діяльності органу.'
+        line3='@AI_Maturity_Bot · ai.maturity.bot@gmail.com · ©2026, Антон Осьмак'
+        canvas.drawCentredString(A4[0]/2,10.0*mm,line1)
+        canvas.drawCentredString(A4[0]/2,7.0*mm,line2)
+        canvas.drawCentredString(A4[0]/2,4.0*mm,line3)
         canvas.restoreState()
-    doc=SimpleDocTemplate(str(out),pagesize=A4,rightMargin=12*mm,leftMargin=12*mm,topMargin=12*mm,bottomMargin=18*mm); story=[Paragraph('AI Maturity Assessment',st['T']),Paragraph('Звіт за результатами оцінювання AI-зрілості органу публічної влади',st['H'])]
+    doc=SimpleDocTemplate(str(out),pagesize=A4,rightMargin=12*mm,leftMargin=12*mm,topMargin=12*mm,bottomMargin=21*mm); story=[Paragraph('AI Maturity Assessment',st['T']),Paragraph('Звіт за результатами оцінювання AI-зрілості органу публічної влади',st['H'])]
     meta=[['Орган',a.get('organization') or ''],['Офіційний сайт',a.get('official_url') or '—'],['Режим оцінювання',MODE_LABEL.get(a.get('mode'),a.get('mode') or '—')],['AIMI',f"{r['aimi']:.1f}%"],['Повнота оцінювання',f"{r['coverage']:.1f}% ({len(r['scores'])}/48)"],['Рівень',maturity_level(r['aimi'])]]
     t=Table([[Paragraph(str(v),st['U']) for v in row] for row in meta],colWidths=[45*mm,135*mm]); t.setStyle(TableStyle([('GRID',(0,0),(-1,-1),.4,colors.grey),('FONTNAME',(0,0),(-1,-1),font),('FONTNAME',(0,0),(0,-1),bold),('VALIGN',(0,0),(-1,-1),'TOP')])); story += [t,Spacer(1,5*mm)]
     if a.get('mode')=='ai': story.append(Paragraph('Примітка: це ШІ-аналіз на основі офіційного вебсайту органу та відкритих джерел із використанням вебпошуку. Показники, для яких не знайдено достатньої доказової інформації, позначено «не визначено».',st['U']))
@@ -560,12 +589,16 @@ async def handle_message(msg):
             '🤖 повністю автоматичний ШІ-аналіз;\n'
             '🤖+👤 ШІ-аналіз з підкріпленням;\n'
             '👤 ручне оцінювання.\n\n'
-            'Для початку натисніть кнопку «Розпочати оцінювання».\n\n'
-            '© 2026, Антон Осьмак'
+            'Важливо: результати мають експериментальний характер і формуються '
+            'в межах розробки та апробації методики оцінювання AI-зрілості органів '
+            'публічної влади. Вони не є офіційною оцінкою діяльності органу.\n\n'
+            'Для початку натисніть кнопку «Розпочати оцінювання».\n'
+            '/start — розпочати\n\n'
+            '©2026, Антон Осьмак'
         )
         await send_start_welcome(chat,welcome); return
     if text=='/help':
-        await send(chat,'AI Maturity Bot — v0.4.0\n\n/new — нове оцінювання\n/status — стан\n/log — журнал\n/report [ID] — короткий звіт\n/pdf [ID] — PDF\n/xlsx [ID] — Excel\n/bundle [ID] — пакет\n/drive [ID] — архівувати пакет\n/export [ID] — JSON audit log\n/cancel — скасувати'); return
+        await send(chat,'AI Maturity Bot — v0.4.1\n\n/new — нове оцінювання\n/status — стан\n/log — журнал\n/report [ID] — короткий звіт\n/pdf [ID] — PDF\n/xlsx [ID] — Excel\n/bundle [ID] — пакет\n/drive [ID] — архівувати пакет\n/export [ID] — JSON audit log\n/cancel — скасувати'); return
     if text in ('/new','▶️ Розпочати оцінювання'): await start_assessment(chat,user); return
     if text=='/cancel':
         with db() as c: a=c.execute("SELECT id FROM assessments WHERE chat_id=? AND status NOT IN ('finished','cancelled') ORDER BY id DESC LIMIT 1",(chat,)).fetchone();
@@ -679,6 +712,9 @@ async def main():
     init_db()
     print(
         'Startup config: '
+        f'AI_PROVIDER={AI_PROVIDER}; '
+        f'GROQ_API_KEY={"set" if bool(GROQ_API_KEY) else "missing"}; '
+        f'GROQ_MODEL={GROQ_MODEL or "missing"}; '
         f'OPENAI_API_KEY={"set" if bool(OPENAI_API_KEY) else "missing"}; '
         f'OPENAI_MODEL={OPENAI_MODEL or "missing"}; '
         f'GDRIVE_UPLOAD={"configured" if bool(GDRIVE_UPLOAD_URL and GDRIVE_UPLOAD_SECRET) else "not-configured"}',

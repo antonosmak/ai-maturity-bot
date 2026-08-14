@@ -40,9 +40,11 @@ OPENAI_API_KEY=_clean_openai_key(os.getenv('OPENAI_API_KEY',''))
 OPENAI_MODEL=(os.getenv('OPENAI_MODEL','') or '').strip()
 GROQ_API_KEY=_clean_secret(os.getenv('GROQ_API_KEY',''))
 GROQ_MODEL=(os.getenv('GROQ_MODEL','openai/gpt-oss-120b') or 'openai/gpt-oss-120b').strip()
-AI_PROVIDER=(os.getenv('AI_PROVIDER','') or '').strip().lower()
-if not AI_PROVIDER:
-    AI_PROVIDER='groq' if GROQ_API_KEY else 'openai'
+GEMINI_API_KEY=_clean_secret(os.getenv('GEMINI_API_KEY',''))
+GEMINI_MODEL=(os.getenv('GEMINI_MODEL','gemini-2.5-flash') or 'gemini-2.5-flash').strip()
+OPENROUTER_API_KEY=_clean_secret(os.getenv('OPENROUTER_API_KEY',''))
+OPENROUTER_MODEL=(os.getenv('OPENROUTER_MODEL','openrouter/free') or 'openrouter/free').strip()
+AI_PROVIDER=(os.getenv('AI_PROVIDER','auto') or 'auto').strip().lower()
 GDRIVE_UPLOAD_URL=(os.getenv('GDRIVE_UPLOAD_URL','') or '').strip()
 GDRIVE_UPLOAD_SECRET=_clean_secret(os.getenv('GDRIVE_UPLOAD_SECRET',''))
 DB_PATH=Path(os.getenv('DB_PATH',str(BASE_DIR/'data'/'ai_maturity.db'))); POLL_TIMEOUT=int(os.getenv('POLL_TIMEOUT','30'))
@@ -54,7 +56,7 @@ MODE_LABEL={'ai':'ШІ-аналіз','hybrid':'ШІ-аналіз з підкрі
 def _safe_log_text(value):
     # Never let credentials escape into Render logs.
     s=str(value or '')
-    secrets=[TOKEN,OPENAI_API_KEY,GROQ_API_KEY,GDRIVE_UPLOAD_SECRET]
+    secrets=[TOKEN,OPENAI_API_KEY,GROQ_API_KEY,GEMINI_API_KEY,OPENROUTER_API_KEY,GDRIVE_UPLOAD_SECRET]
     for secret in secrets:
         if secret:
             s=s.replace(secret,'***REDACTED***')
@@ -446,30 +448,33 @@ def _criteria_batches():
     return batches
 
 async def ai_assess(aid,organization,url):
+    """Run D1-D8 with automatic free-provider fallback.
+
+    Provider order: Gemini -> Groq -> OpenRouter. A provider failure affects only
+    the current D-block; the next provider receives the same compact prompt.
+    """
     import asyncio
 
-    provider=AI_PROVIDER
-    _diag('start',aid,provider=provider,organization=organization,url=url)
+    providers=[]
+    if GEMINI_API_KEY:
+        providers.append(('gemini',GEMINI_MODEL))
+    if GROQ_API_KEY:
+        providers.append(('groq',GROQ_MODEL))
+    if OPENROUTER_API_KEY:
+        providers.append(('openrouter',OPENROUTER_MODEL))
 
-    if provider=='groq':
-        if not GROQ_API_KEY:
-            raise RuntimeError('Для Groq потрібно задати GROQ_API_KEY у Render.')
-        model=GROQ_MODEL or 'openai/gpt-oss-120b'
-        endpoint='https://api.groq.com/openai/v1/responses'
-        api_key=GROQ_API_KEY
-        _diag('provider_ready',aid,provider=provider,model=model)
-    elif provider=='openai':
-        if not OPENAI_API_KEY or not OPENAI_MODEL:
-            raise RuntimeError('Для OpenAI потрібно задати OPENAI_API_KEY та OPENAI_MODEL у Render.')
-        model=OPENAI_MODEL
-        endpoint='https://api.openai.com/v1/responses'
-        api_key=OPENAI_API_KEY
-        _diag('provider_ready',aid,provider=provider,model=model)
-    else:
-        raise RuntimeError(f'Невідомий AI_PROVIDER: {provider}')
+    # Optional explicit provider can be placed first, while keeping fallback.
+    if AI_PROVIDER not in ('','auto'):
+        providers.sort(key=lambda x: 0 if x[0]==AI_PROVIDER else 1)
 
-    # Site reading is only auxiliary. Keep the excerpt very small because the
-    # Groq free tier in the current account enforces a low TPM ceiling.
+    if not providers:
+        raise RuntimeError(
+            'Не задано жодного безкоштовного AI-провайдера. '
+            'Додайте GEMINI_API_KEY, GROQ_API_KEY або OPENROUTER_API_KEY у Render.'
+        )
+    _diag('start',aid,provider_chain='>'.join(p[0] for p in providers),
+          organization=organization,url=url)
+
     try:
         corpus,pages=await crawl_official_site(url)
     except Exception as e:
@@ -477,7 +482,8 @@ async def ai_assess(aid,organization,url):
         corpus,pages='',0
 
     official_excerpt=(corpus[:2500] if corpus.strip() else
-        '[Сайт не вдалося автоматично прочитати. Використовуй вебпошук і пріоритетно офіційні джерела.]')
+        '[Сайт не вдалося автоматично прочитати. Використовуй наданий фрагмент і власні знання; '
+        'не вигадуй джерела. Якщо доказу немає, score=null.]')
 
     batches=_criteria_batches()
     with db() as c:
@@ -491,11 +497,6 @@ async def ai_assess(aid,organization,url):
         ar=c.execute('SELECT chat_id FROM assessments WHERE id=?',(aid,)).fetchone()
         chat_id=ar['chat_id'] if ar else None
 
-    headers={
-        'Authorization':f'Bearer {api_key}',
-        'Content-Type':'application/json'
-    }
-
     for batch_no,(dim,criteria) in enumerate(batches,1):
         if batch_no < start_batch:
             _diag('batch_skip_completed',aid,batch=batch_no,dimension=dim)
@@ -504,8 +505,6 @@ async def ai_assess(aid,organization,url):
         if chat_id:
             await send(chat_id,f'Триває ШІ-аналіз блоку {dim} ({batch_no}/{len(batches)}).')
 
-        # Compact prompt: the previous diagnostic showed that a D1 request
-        # requested >10K tokens against an 8K Groq TPM limit.
         prompt=f"""
 Оціни AI-зрілість органу публічної влади лише за наведеними критеріями.
 
@@ -514,12 +513,12 @@ async def ai_assess(aid,organization,url):
 Блок: {dim}
 
 Правила:
-- шукай у вебі за назвою органу, офіційним доменом і змістом критерію;
+- використовуй наведений фрагмент офіційного сайту та лише достовірні відомості;
 - пріоритет: офіційний сайт/документи -> інші офіційні джерела -> надійні аналітичні джерела/ЗМІ;
 - відсутність доказу не означає 0;
 - score 0–5 став лише за достатнього доказу, інакше score=null;
 - не домислюй внутрішні процеси;
-- для визначеної оцінки дай 1–2 URL;
+- для визначеної оцінки дай до 2 URL, якщо вони достовірно відомі;
 - поверни лише JSON.
 
 JSON:
@@ -534,99 +533,108 @@ JSON:
 {official_excerpt}
 """.strip()
 
-        if provider=='groq':
-            payload={
-                'model':model,
-                'input':prompt,
-                'tools':[{'type':'browser_search'}],
-                'tool_choice':'required',
-                # Keep requested tokens safely below the free-tier TPM ceiling.
-                'max_output_tokens':1600
-            }
-        else:
-            payload={
-                'model':model,
-                'input':prompt,
-                'tools':[{
-                    'type':'web_search',
-                    'external_web_access':True,
-                    'search_context_size':'low'
-                }],
-                'max_output_tokens':2000
-            }
-
         _diag('batch_start',aid,batch=batch_no,dimension=dim,criteria=len(criteria))
-        _diag('request_send',aid,provider=provider,model=model,endpoint=endpoint,batch=batch_no,dimension=dim)
+        data=None
+        model_text=''
+        failures=[]
 
-        try:
-            async with httpx.AsyncClient(timeout=300,follow_redirects=True) as c:
-                resp=await c.post(endpoint,headers=headers,json=payload)
-            _diag('response_received',aid,provider=provider,status=resp.status_code,
-                  request_id=resp.headers.get('x-request-id',''),
-                  content_type=resp.headers.get('content-type',''),
-                  batch=batch_no,dimension=dim)
-        except Exception as e:
-            _diag('transport_error',aid,batch=batch_no,dimension=dim,
-                  error_type=type(e).__name__,detail=str(e))
-            raise RuntimeError(f'Помилка з’єднання з AI-провайдером {provider}.') from None
+        for provider,model in providers:
+            try:
+                if provider=='gemini':
+                    endpoint=f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent'
+                    headers={'x-goog-api-key':GEMINI_API_KEY,'Content-Type':'application/json'}
+                    payload={
+                        'contents':[{'parts':[{'text':prompt}]}],
+                        'generationConfig':{
+                            'responseMimeType':'application/json',
+                            'maxOutputTokens':2000,
+                            'temperature':0.1
+                        }
+                    }
+                elif provider=='groq':
+                    endpoint='https://api.groq.com/openai/v1/responses'
+                    headers={'Authorization':f'Bearer {GROQ_API_KEY}','Content-Type':'application/json'}
+                    payload={
+                        'model':model,'input':prompt,
+                        'tools':[{'type':'browser_search'}],
+                        'tool_choice':'required','max_output_tokens':1600
+                    }
+                else:
+                    endpoint='https://openrouter.ai/api/v1/chat/completions'
+                    headers={
+                        'Authorization':f'Bearer {OPENROUTER_API_KEY}',
+                        'Content-Type':'application/json',
+                        'HTTP-Referer':'https://ai-maturity-bot.onrender.com',
+                        'X-Title':'AI Maturity Bot'
+                    }
+                    payload={
+                        'model':model,
+                        'messages':[{'role':'user','content':prompt}],
+                        'response_format':{'type':'json_object'},
+                        'max_tokens':2000,
+                        'temperature':0.1
+                    }
 
-        if resp.status_code>=400:
-            body=_safe_log_text(resp.text[:2500])
-            rid=resp.headers.get('x-request-id','')
-            print(f'{provider} API error: status={resp.status_code} request_id={rid} '
-                  f'batch={batch_no} dimension={dim} body={body}',flush=True)
+                _diag('provider_attempt',aid,provider=provider,model=model,
+                      batch=batch_no,dimension=dim)
+                async with httpx.AsyncClient(timeout=300,follow_redirects=True) as hc:
+                    resp=await hc.post(endpoint,headers=headers,json=payload)
+                _diag('response_received',aid,provider=provider,status=resp.status_code,
+                      request_id=resp.headers.get('x-request-id',''),
+                      batch=batch_no,dimension=dim)
 
-            if resp.status_code==429:
-                retry_hint=''
-                m=re.search(r'Please try again in\s+([^."}]+)',body,re.I)
-                if m:
-                    retry_hint=m.group(1).strip()
-                with db() as c:
-                    c.execute(
-                        "UPDATE assessments SET status='ai_paused',ai_next_batch=? WHERE id=?",
-                        (batch_no,aid)
-                    )
-                _diag('rate_limit_paused',aid,batch=batch_no,dimension=dim,retry_hint=retry_hint)
-                raise AIRateLimitPause(provider,dim,retry_hint)
+                if resp.status_code>=400:
+                    body=_safe_log_text(resp.text[:1800])
+                    failures.append(f'{provider}: HTTP {resp.status_code}')
+                    print(f'{provider} API fallback: status={resp.status_code} '
+                          f'batch={batch_no} dimension={dim} body={body}',flush=True)
+                    _diag('provider_fallback',aid,provider=provider,status=resp.status_code,
+                          batch=batch_no,dimension=dim)
+                    continue
 
-            raise RuntimeError(
-                f'AI-провайдер {provider} повернув HTTP {resp.status_code} '
-                f'під час аналізу блоку {dim}.'
-            )
+                data=resp.json()
+                if provider=='gemini':
+                    model_text=''
+                    for cand in data.get('candidates',[]) or []:
+                        for part in ((cand.get('content') or {}).get('parts') or []):
+                            if isinstance(part,dict) and part.get('text'):
+                                model_text+=str(part['text'])
+                elif provider=='openrouter':
+                    choices=data.get('choices') or []
+                    model_text=str((((choices[0] if choices else {}).get('message') or {}).get('content')) or '')
+                else:
+                    model_text=_response_output_text(data)
 
-        try:
-            data=resp.json()
-            _diag('json_parsed',aid,batch=batch_no,dimension=dim,
-                  top_keys=','.join(list(data.keys())[:20]) if isinstance(data,dict) else type(data).__name__)
-        except Exception as e:
-            _diag('json_parse_error',aid,batch=batch_no,dimension=dim,
-                  error_type=type(e).__name__,detail=str(e),body_preview=resp.text[:1000])
-            raise RuntimeError(f'AI-провайдер {provider} повернув некоректну JSON-відповідь.') from None
+                if not model_text.strip():
+                    failures.append(f'{provider}: порожня відповідь')
+                    _diag('provider_fallback_empty',aid,provider=provider,batch=batch_no,dimension=dim)
+                    continue
 
-        model_text=_response_output_text(data)
-        _diag('output_text_extracted',aid,batch=batch_no,dimension=dim,
-              chars=len(model_text or ''),preview=(model_text or '')[:220])
+                try:
+                    obj=_json_from_model_text(model_text)
+                    _diag('provider_success',aid,provider=provider,model=model,
+                          batch=batch_no,dimension=dim,chars=len(model_text))
+                    break
+                except Exception as pe:
+                    failures.append(f'{provider}: некоректний JSON')
+                    _diag('provider_fallback_json',aid,provider=provider,batch=batch_no,
+                          dimension=dim,error_type=type(pe).__name__)
+                    obj=None
+                    continue
+            except Exception as e:
+                failures.append(f'{provider}: {type(e).__name__}')
+                _diag('provider_exception_fallback',aid,provider=provider,batch=batch_no,
+                      dimension=dim,error_type=type(e).__name__,detail=str(e))
+                obj=None
+                continue
 
-        try:
-            obj=_json_from_model_text(model_text)
-            parse_mode=obj.get('_parse_mode','unknown') if isinstance(obj,dict) else 'unknown'
-            _diag('assessment_json_parsed',aid,batch=batch_no,dimension=dim,
-                  parse_mode=parse_mode,
-                  salvaged=obj.get('_salvaged_items','') if isinstance(obj,dict) else '',
-                  failed=obj.get('_failed_items','') if isinstance(obj,dict) else '',
-                  keys=','.join(list(obj.keys())[:20]) if isinstance(obj,dict) else '')
-        except Exception as e:
-            # A malformed D-block must not destroy the entire assessment.
-            # Leave this block as "not determined" and continue with the next one.
-            _diag('assessment_json_error',aid,batch=batch_no,dimension=dim,
-                  error_type=type(e).__name__,detail=str(e),text_preview=(model_text or '')[:1000])
-            notes.append(f'{dim}: відповідь ШІ не вдалося структуровано розібрати; показники залишено невизначеними.')
-            if chat_id:
-                await send(chat_id,f'ШІ-аналіз: {dim} отримано, але частину результатів не вдалося структуровано розібрати. Переходжу до наступного блоку.')
-            if provider=='groq' and batch_no < len(batches):
-                _diag('rate_limit_pause',aid,seconds=65,next_batch=batch_no+1)
-                await asyncio.sleep(65)
-            continue
+        if not model_text.strip() or obj is None:
+            with db() as c:
+                c.execute("UPDATE assessments SET status='ai_paused',ai_next_batch=? WHERE id=?",
+                          (batch_no,aid))
+            detail='; '.join(failures) or 'усі провайдери недоступні'
+            _diag('all_providers_failed',aid,batch=batch_no,dimension=dim,detail=detail)
+            raise AIRateLimitPause('Gemini/Groq/OpenRouter',dim,'')
 
         saved_this=0
         with db() as c:
@@ -691,9 +699,6 @@ JSON:
 
         # The current Groq free tier on this account reports 8K TPM.
         # Pacing avoids the next dimension immediately exhausting the same minute bucket.
-        if provider=='groq' and batch_no < len(batches):
-            _diag('rate_limit_pause',aid,seconds=65,next_batch=batch_no+1)
-            await asyncio.sleep(65)
 
     with db() as c:
         note=(
@@ -887,7 +892,7 @@ async def handle_message(msg):
         )
         await send_start_welcome(chat,welcome); return
     if text=='/help':
-        await send(chat,'AI Maturity Bot — v0.4.6\n\n/new — нове оцінювання\n/status — стан\n/log — журнал\n/report [ID] — короткий звіт\n/pdf [ID] — PDF\n/xlsx [ID] — Excel\n/bundle [ID] — пакет\n/drive [ID] — архівувати пакет\n/export [ID] — JSON audit log\n/cancel — скасувати'); return
+        await send(chat,'AI Maturity Bot — v0.4.7\n\n/new — нове оцінювання\n/status — стан\n/log — журнал\n/report [ID] — короткий звіт\n/pdf [ID] — PDF\n/xlsx [ID] — Excel\n/bundle [ID] — пакет\n/drive [ID] — архівувати пакет\n/export [ID] — JSON audit log\n/cancel — скасувати'); return
     if text in ('/new','▶️ Розпочати оцінювання'): await start_assessment(chat,user); return
     if text=='/cancel':
         with db() as c: a=c.execute("SELECT id FROM assessments WHERE chat_id=? AND status NOT IN ('finished','cancelled') ORDER BY id DESC LIMIT 1",(chat,)).fetchone();

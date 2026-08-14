@@ -273,10 +273,10 @@ async def handle_message(msg):
             'Для початку натисніть кнопку «Розпочати оцінювання».\n\n'
             '© 2026, Антон Осьмак'
         )
-        keyboard={'keyboard':[[{'text':'▶️ Розпочати оцінювання'}]],'resize_keyboard':True}
+        keyboard=[[{'text':'▶️ Розпочати оцінювання','callback_data':'start:new'}]]
         await send(chat,welcome,keyboard); return
     if text=='/help':
-        await send(chat,'AI Maturity Bot — v0.3.4\n\n/new — нове оцінювання\n/status — стан\n/log — журнал\n/report [ID] — короткий звіт\n/pdf [ID] — PDF\n/xlsx [ID] — Excel\n/bundle [ID] — пакет\n/drive [ID] — архівувати пакет\n/export [ID] — JSON audit log\n/cancel — скасувати'); return
+        await send(chat,'AI Maturity Bot — v0.3.5\n\n/new — нове оцінювання\n/status — стан\n/log — журнал\n/report [ID] — короткий звіт\n/pdf [ID] — PDF\n/xlsx [ID] — Excel\n/bundle [ID] — пакет\n/drive [ID] — архівувати пакет\n/export [ID] — JSON audit log\n/cancel — скасувати'); return
     if text in ('/new','▶️ Розпочати оцінювання'): await start_assessment(chat,user); return
     if text=='/cancel':
         with db() as c: a=c.execute("SELECT id FROM assessments WHERE chat_id=? AND status NOT IN ('finished','cancelled') ORDER BY id DESC LIMIT 1",(chat,)).fetchone();
@@ -352,6 +352,9 @@ async def handle_callback(cb):
     data=cb.get('data',''); chat=cb.get('message',{}).get('chat',{}).get('id');
     if not chat:return
     await tg('answerCallbackQuery',{'callback_query_id':cb['id']}); p=data.split(':')
+    if p[0]=='start' and len(p)==2 and p[1]=='new':
+        await start_assessment(chat,cb.get('from',{}))
+        return
     if p[0]=='repeat' and len(p)==2:
         # Нове незалежне оцінювання; попередній результат залишається в журналі.
         await start_assessment(chat,cb.get('from',{}))

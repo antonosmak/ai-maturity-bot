@@ -2,3 +2,5 @@ httpx>=0.28,<1
 matplotlib>=3.8,<4
 flask>=3.0,<4
 gunicorn>=23,<24
+reportlab>=4.2,<5
+XlsxWriter>=3.2,<4

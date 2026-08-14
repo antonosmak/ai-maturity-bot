@@ -18,3 +18,7 @@ services:
         sync: false
       - key: OPENAI_MODEL
         sync: false
+      - key: GDRIVE_UPLOAD_URL
+        sync: false
+      - key: GDRIVE_UPLOAD_SECRET
+        sync: false

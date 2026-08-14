@@ -1,34 +1,51 @@
-# AI Maturity Telegram Bot — Render edition
+# AI Maturity Telegram Bot — v0.2.2
 
-Ця версія адаптована для Render Web Service і Telegram webhook.
+Прототип Telegram-бота для оцінювання AI-зрілості органу публічної влади за матрицею D1–D8 (48 діагностичних тверджень).
 
-## Файли
-- `app.py` — Flask endpoint для Telegram webhook та health check.
-- `bot.py` — логіка оцінювання; локальний polling залишено для тестів.
-- `matrix.json` — 48 показників D1.1–D8.6.
-- `render.yaml` — Render Blueprint.
-- `requirements.txt` — Python-залежності.
+## Що працює
 
-## Змінні середовища
-Обов'язково:
+- 48-позиційне оцінювання за шкалою 0–5;
+- автоматичний розрахунок D1–D8 та AIMI;
+- визначення рівня AI-зрілості;
+- радарна діаграма;
+- фінальна верифікація результату респондентом;
+- базові/AI-рекомендації;
+- PDF, XLSX, JSON audit log та ZIP bundle;
+- після фінального коментаря PDF автоматично надсилається респонденту в Telegram;
+- копія фінального PDF автоматично архівується в Google Drive через Google Apps Script;
+- `/drive [ID]` вручну архівує PDF + XLSX + JSON + Radar у Google Drive.
+
+## Render Environment Variables
+
+Обов'язкові:
+
 - `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_WEBHOOK_SECRET`
 
-Автоматично/рекомендовано:
-- `TELEGRAM_WEBHOOK_SECRET` — секрет Telegram webhook; `render.yaml` може згенерувати його.
+Для Google Drive:
 
-Необов'язково:
+- `GDRIVE_UPLOAD_URL` — URL вебдодатка Apps Script, що закінчується `/exec`
+- `GDRIVE_UPLOAD_SECRET` — той самий SECRET, що заданий у Apps Script
+
+Опційні для AI-рекомендацій:
+
 - `OPENAI_API_KEY`
 - `OPENAI_MODEL`
 
-## Render
-Start command:
-`gunicorn --workers 1 --threads 4 --timeout 120 --bind 0.0.0.0:$PORT app:app`
+## Команди
 
-Health check:
-`/health`
+- `/new` — нове оцінювання
+- `/status` — стан
+- `/log` — журнал
+- `/report [ID]` — короткий звіт
+- `/pdf [ID]` — PDF
+- `/xlsx [ID]` — XLSX
+- `/bundle [ID]` — ZIP-пакет
+- `/drive [ID]` — архівувати пакет у Google Drive
+- `/recommend [ID]` — рекомендації
+- `/export [ID]` — JSON audit log
+- `/cancel` — скасувати
 
-Після старту `app.py` використовує `RENDER_EXTERNAL_URL` і реєструє
-`https://<service>.onrender.com/telegram/webhook` у Telegram через `setWebhook`.
+## Оновлення з v0.1/v0.2
 
-## Важливо про дані
-На Free Render локальна файлова система є тимчасовою. SQLite та створені локально звіти можуть бути втрачені під час redeploy/restart. Для апробації журнал треба перенести у зовнішню БД або архівувати результати у Google Drive.
+Файли цього пакета можна завантажити в корінь GitHub-репозиторію з заміною однойменних файлів. Не завантажуйте `__pycache__`, локальні `data/*.db` або `exports/*`.

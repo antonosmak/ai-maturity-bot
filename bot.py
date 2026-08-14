@@ -85,7 +85,7 @@ def _col(c,t,n,decl):
 def init_db():
     with db() as c:
         c.executescript('''CREATE TABLE IF NOT EXISTS assessments(id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER NOT NULL,user_id INTEGER,username TEXT,organization TEXT,status TEXT NOT NULL DEFAULT 'await_mode',current_index INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,finished_at TEXT,validation_score INTEGER,validation_comment TEXT,recommendations TEXT); CREATE TABLE IF NOT EXISTS answers(assessment_id INTEGER NOT NULL,code TEXT NOT NULL,score INTEGER NOT NULL,source TEXT NOT NULL DEFAULT 'respondent',evidence TEXT,rationale TEXT,confidence REAL,created_at TEXT NOT NULL,PRIMARY KEY(assessment_id,code));''')
-        _col(c,'assessments','mode','TEXT'); _col(c,'assessments','official_url','TEXT'); _col(c,'assessments','coverage','REAL'); _col(c,'assessments','ai_note','TEXT')
+        _col(c,'assessments','mode','TEXT'); _col(c,'assessments','official_url','TEXT'); _col(c,'assessments','coverage','REAL'); _col(c,'assessments','ai_note','TEXT'); _col(c,'assessments','ai_next_batch','INTEGER DEFAULT 1')
 
 def now_iso(): return datetime.now(timezone.utc).isoformat()
 def maturity_level(v):
@@ -178,6 +178,16 @@ def validation_keyboard(aid): return [[{'text':str(s),'callback_data':f'valid:{a
 
 def repeat_keyboard(aid):
     return [[{'text':'🔄 Повторити оцінювання','callback_data':f'repeat:{aid}'}]]
+
+class AIRateLimitPause(RuntimeError):
+    def __init__(self, provider, dimension, retry_hint=''):
+        self.provider=provider
+        self.dimension=dimension
+        self.retry_hint=retry_hint
+        super().__init__(f'Тимчасовий ліміт {provider} під час аналізу {dimension}')
+
+def resume_ai_keyboard(aid):
+    return [[{'text':'▶️ Продовжити ШІ-аналіз','callback_data':f'resumeai:{aid}'}]]
 
 def error_home_keyboard(aid):
     return [[{'text':'↩️ Повернутися на стартовий екран','callback_data':f'errorhome:{aid}'}]]
@@ -470,7 +480,10 @@ async def ai_assess(aid,organization,url):
         '[Сайт не вдалося автоматично прочитати. Використовуй вебпошук і пріоритетно офіційні джерела.]')
 
     batches=_criteria_batches()
-    total_saved=0
+    with db() as c:
+        state=c.execute('SELECT ai_next_batch FROM assessments WHERE id=?',(aid,)).fetchone()
+    start_batch=max(1,int((state['ai_next_batch'] if state and state['ai_next_batch'] else 1)))
+    total_saved=len(calc_results(aid)['scores'])
     notes=[]
     allowed={x['code'] for x in MATRIX}
 
@@ -484,6 +497,13 @@ async def ai_assess(aid,organization,url):
     }
 
     for batch_no,(dim,criteria) in enumerate(batches,1):
+        if batch_no < start_batch:
+            _diag('batch_skip_completed',aid,batch=batch_no,dimension=dim)
+            continue
+
+        if chat_id:
+            await send(chat_id,f'Триває ШІ-аналіз блоку {dim} ({batch_no}/{len(batches)}).')
+
         # Compact prompt: the previous diagnostic showed that a D1 request
         # requested >10K tokens against an 8K Groq TPM limit.
         prompt=f"""
@@ -555,6 +575,20 @@ JSON:
             rid=resp.headers.get('x-request-id','')
             print(f'{provider} API error: status={resp.status_code} request_id={rid} '
                   f'batch={batch_no} dimension={dim} body={body}',flush=True)
+
+            if resp.status_code==429:
+                retry_hint=''
+                m=re.search(r'Please try again in\s+([^."}]+)',body,re.I)
+                if m:
+                    retry_hint=m.group(1).strip()
+                with db() as c:
+                    c.execute(
+                        "UPDATE assessments SET status='ai_paused',ai_next_batch=? WHERE id=?",
+                        (batch_no,aid)
+                    )
+                _diag('rate_limit_paused',aid,batch=batch_no,dimension=dim,retry_hint=retry_hint)
+                raise AIRateLimitPause(provider,dim,retry_hint)
+
             raise RuntimeError(
                 f'AI-провайдер {provider} повернув HTTP {resp.status_code} '
                 f'під час аналізу блоку {dim}.'
@@ -639,6 +673,11 @@ JSON:
                 saved_this+=1
 
         total_saved+=saved_this
+        with db() as c:
+            c.execute(
+                "UPDATE assessments SET ai_next_batch=?,status='ai_running' WHERE id=?",
+                (batch_no+1,aid)
+            )
         note=str(obj.get('research_note') or '').strip()
         parse_mode=str(obj.get('_parse_mode') or 'unknown')
         if note:
@@ -648,7 +687,7 @@ JSON:
         _diag('batch_saved',aid,batch=batch_no,dimension=dim,saved=saved_this,total_saved=total_saved)
 
         if chat_id:
-            await send(chat_id,f'ШІ-аналіз: завершено {dim} ({batch_no}/{len(batches)}).')
+            await send(chat_id,f'ШІ-аналіз блоку {dim} завершено ({batch_no}/{len(batches)}).')
 
         # The current Groq free tier on this account reports 8K TPM.
         # Pacing avoids the next dimension immediately exhausting the same minute bucket.
@@ -671,20 +710,40 @@ JSON:
     _diag('complete',aid,provider=provider,model=model,saved=total_saved,batches=len(batches))
     return total_saved,pages
 
-async def run_ai_stage(chat,aid):
+async def run_ai_stage(chat,aid,resume=False):
     with db() as c:
         a=c.execute('SELECT * FROM assessments WHERE id=?',(aid,)).fetchone()
+        if not a:
+            await send(chat,'Оцінювання не знайдено.')
+            return
+        c.execute("UPDATE assessments SET status='ai_running' WHERE id=?",(aid,))
 
-    await send(
-        chat,
-        'Виконую пакетний ШІ-аналіз офіційного вебсайту та відкритих джерел за блоками D1–D8. '
-        'Якщо офіційний сайт технічно недоступний для автоматичного читання, '
-        'оцінювання продовжиться за відкритими джерелами. У безкоштовному режимі Groq аналіз виконується послідовно за D1–D8 і може тривати близько 8–10 хвилин…'
-    )
+    if not resume:
+        await send(
+            chat,
+            'Виконую пакетний ШІ-аналіз офіційного вебсайту та відкритих джерел за 8 блоками. '
+            'Якщо офіційний сайт технічно недоступний для автоматичного читання, '
+            'оцінювання продовжиться за відкритими джерелами.\n\n'
+            'Аналіз виконується послідовно за блоками D1–D8 і може тривати близько 8–10 хвилин.'
+        )
+    else:
+        await send(chat,'Продовжую ШІ-аналіз із блоку, на якому оцінювання було призупинено.')
+
     try:
         saved,pages=await ai_assess(aid,a['organization'],a['official_url'])
+    except AIRateLimitPause as e:
+        hint=f'\nОрієнтовний час до повторної спроби: {e.retry_hint}.' if e.retry_hint else ''
+        await send(
+            chat,
+            '⏸ Досягнуто тимчасового безкоштовного ліміту AI-провайдера. '
+            'Уже отримані результати збережено, оцінювання не скасовано.'
+            f'{hint}\n\n'
+            'Після відновлення ліміту натисніть кнопку нижче — аналіз продовжиться '
+            f'з блоку {e.dimension}.',
+            resume_ai_keyboard(aid)
+        )
+        return
     except Exception as e:
-        # A failed AI run is closed so the user can immediately start again.
         with db() as c:
             c.execute("UPDATE assessments SET status='cancelled' WHERE id=?",(aid,))
         print(f'[AI-DIAG] stage=assessment_failed aid={aid}: type={type(e).__name__} detail={_safe_log_text(e)}',flush=True)
@@ -696,6 +755,9 @@ async def run_ai_stage(chat,aid):
             error_home_keyboard(aid)
         )
         return
+
+    with db() as c:
+        c.execute("UPDATE assessments SET status='ai_complete',ai_next_batch=9 WHERE id=?",(aid,))
 
     miss=missing_indices(aid)
     mode=a['mode']
@@ -825,7 +887,7 @@ async def handle_message(msg):
         )
         await send_start_welcome(chat,welcome); return
     if text=='/help':
-        await send(chat,'AI Maturity Bot — v0.4.5\n\n/new — нове оцінювання\n/status — стан\n/log — журнал\n/report [ID] — короткий звіт\n/pdf [ID] — PDF\n/xlsx [ID] — Excel\n/bundle [ID] — пакет\n/drive [ID] — архівувати пакет\n/export [ID] — JSON audit log\n/cancel — скасувати'); return
+        await send(chat,'AI Maturity Bot — v0.4.6\n\n/new — нове оцінювання\n/status — стан\n/log — журнал\n/report [ID] — короткий звіт\n/pdf [ID] — PDF\n/xlsx [ID] — Excel\n/bundle [ID] — пакет\n/drive [ID] — архівувати пакет\n/export [ID] — JSON audit log\n/cancel — скасувати'); return
     if text in ('/new','▶️ Розпочати оцінювання'): await start_assessment(chat,user); return
     if text=='/cancel':
         with db() as c: a=c.execute("SELECT id FROM assessments WHERE chat_id=? AND status NOT IN ('finished','cancelled') ORDER BY id DESC LIMIT 1",(chat,)).fetchone();
@@ -901,6 +963,18 @@ async def handle_callback(cb):
     data=cb.get('data',''); chat=cb.get('message',{}).get('chat',{}).get('id');
     if not chat:return
     await tg('answerCallbackQuery',{'callback_query_id':cb['id']}); p=data.split(':')
+    if p[0]=='resumeai' and len(p)==2:
+        aid=int(p[1])
+        with db() as c:
+            a=c.execute('SELECT * FROM assessments WHERE id=? AND chat_id=?',(aid,chat)).fetchone()
+        if not a:
+            await send(chat,'Оцінювання не знайдено.')
+            return
+        if a['status'] not in ('ai_paused','ai_running'):
+            await send(chat,'Це оцінювання вже не очікує продовження.')
+            return
+        await run_ai_stage(chat,aid,resume=True)
+        return
     if p[0]=='errorhome' and len(p)==2:
         # Failed assessment is already cancelled; create a fresh start screen.
         await start_assessment(chat,cb.get('from',{}))

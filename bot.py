@@ -23,13 +23,40 @@ MATRIX=json.loads((BASE_DIR/'matrix.json').read_text(encoding='utf-8'))
 DIMENSIONS=[]
 for x in MATRIX:
     if x['dimension'] not in [d[0] for d in DIMENSIONS]: DIMENSIONS.append((x['dimension'],x['dimension_name']))
-TOKEN=os.getenv('TELEGRAM_BOT_TOKEN','').strip(); OPENAI_API_KEY=os.getenv('OPENAI_API_KEY','').strip(); OPENAI_MODEL=os.getenv('OPENAI_MODEL','').strip()
-GDRIVE_UPLOAD_URL=os.getenv('GDRIVE_UPLOAD_URL','').strip(); GDRIVE_UPLOAD_SECRET=os.getenv('GDRIVE_UPLOAD_SECRET','').strip()
+def _clean_secret(value):
+    # Environment values copied from web UIs may accidentally contain spaces,
+    # CR/LF or tabs. API keys never require whitespace.
+    return ''.join((value or '').split())
+
+def _clean_openai_key(value):
+    value=_clean_secret(value)
+    # Be tolerant if the user pasted an entire Authorization value.
+    if value.lower().startswith('bearer'):
+        value=value[6:].lstrip(':').strip()
+    return value
+
+TOKEN=_clean_secret(os.getenv('TELEGRAM_BOT_TOKEN',''))
+OPENAI_API_KEY=_clean_openai_key(os.getenv('OPENAI_API_KEY',''))
+OPENAI_MODEL=(os.getenv('OPENAI_MODEL','') or '').strip()
+GDRIVE_UPLOAD_URL=(os.getenv('GDRIVE_UPLOAD_URL','') or '').strip()
+GDRIVE_UPLOAD_SECRET=_clean_secret(os.getenv('GDRIVE_UPLOAD_SECRET',''))
 DB_PATH=Path(os.getenv('DB_PATH',str(BASE_DIR/'data'/'ai_maturity.db'))); POLL_TIMEOUT=int(os.getenv('POLL_TIMEOUT','30'))
 if not TOKEN: raise SystemExit('Не задано TELEGRAM_BOT_TOKEN')
 API=f'https://api.telegram.org/bot{TOKEN}'
 SCALE={0:'Відсутність',1:'Початковий',2:'Фрагментарний',3:'Системний',4:'Інтегрований',5:'Трансформаційний'}
 MODE_LABEL={'ai':'ШІ-аналіз','hybrid':'ШІ-аналіз з підкріпленням','manual':'Ручне оцінювання'}
+
+def _safe_log_text(value):
+    # Never let credentials escape into Render logs.
+    s=str(value or '')
+    secrets=[TOKEN,OPENAI_API_KEY,GDRIVE_UPLOAD_SECRET]
+    for secret in secrets:
+        if secret:
+            s=s.replace(secret,'***REDACTED***')
+    # Extra protection for API-key-like strings echoed by third-party errors.
+    s=re.sub(r'(?i)sk-(?:proj-)?[A-Za-z0-9_\-]{8,}','sk-***REDACTED***',s)
+    s=re.sub(r'(?i)(Bearer\s+)[^\s\'\"]+',r'\1***REDACTED***',s)
+    return s
 
 def db():
     DB_PATH.parent.mkdir(parents=True,exist_ok=True); c=sqlite3.connect(DB_PATH); c.row_factory=sqlite3.Row; return c
@@ -96,7 +123,7 @@ async def configure_telegram_ui():
     # message history is cleared, unlike a reply keyboard that only appears
     # after the bot has sent a message.
     commands=[
-        {'command':'start','description':'Старт / головний екран'},
+        {'command':'start','description':'▶️ Старт / головний екран'},
         {'command':'new','description':'Розпочати нове оцінювання'},
         {'command':'status','description':'Стан поточного оцінювання'},
         {'command':'log','description':'Журнал оцінювань'},
@@ -105,7 +132,18 @@ async def configure_telegram_ui():
     try:
         await tg('setMyCommands',{'commands':commands})
         await tg('setChatMenuButton',{'menu_button':{'type':'commands'}})
-        print('Telegram command menu configured',flush=True)
+        await tg('setMyShortDescription',{
+            'short_description':'Оцінювання AI-зрілості органів публічної влади: ШІ-аналіз, ШІ+людина та ручний режим.'
+        })
+        await tg('setMyDescription',{
+            'description':(
+                'AI Maturity Bot — дослідницький інформаційно-аналітичний інструмент '
+                'для комплексного оцінювання AI-зрілості органів публічної влади. '
+                'Автоматичний аналіз виконується на основі офіційного вебсайту та відкритих джерел. '
+                '© 2026, Антон Осьмак'
+            )
+        })
+        print('Telegram command menu and descriptions configured',flush=True)
     except Exception as e:
         # The bot itself must still start even if Telegram temporarily rejects
         # a UI configuration call.
@@ -299,14 +337,21 @@ async def ai_assess(aid,organization,url):
         'max_output_tokens':14000
     }
 
-    async with httpx.AsyncClient(timeout=300,follow_redirects=True) as c:
-        resp=await c.post('https://api.openai.com/v1/responses',headers=headers,json=payload)
-        if resp.status_code>=400:
-            body=resp.text[:2500]
-            rid=resp.headers.get('x-request-id','')
-            print(f'OpenAI API error: status={resp.status_code} request_id={rid} body={body}',flush=True)
-            raise RuntimeError(f'OpenAI API HTTP {resp.status_code}: {body}')
-        data=resp.json()
+    try:
+        async with httpx.AsyncClient(timeout=300,follow_redirects=True) as c:
+            resp=await c.post('https://api.openai.com/v1/responses',headers=headers,json=payload)
+    except Exception as e:
+        safe=_safe_log_text(e)
+        print(f'OpenAI transport error: type={type(e).__name__} detail={safe}',flush=True)
+        raise RuntimeError('Помилка з’єднання з OpenAI API.') from None
+
+    if resp.status_code>=400:
+        body=_safe_log_text(resp.text[:2500])
+        rid=resp.headers.get('x-request-id','')
+        print(f'OpenAI API error: status={resp.status_code} request_id={rid} body={body}',flush=True)
+        # Keep the user-facing exception generic; details remain in Render logs.
+        raise RuntimeError(f'OpenAI API повернув HTTP {resp.status_code}.')
+    data=resp.json()
 
     model_text=_response_output_text(data)
     obj=_json_from_model_text(model_text)
@@ -383,7 +428,7 @@ async def run_ai_stage(chat,aid):
         # A failed AI run is closed so the user can immediately start again.
         with db() as c:
             c.execute("UPDATE assessments SET status='cancelled' WHERE id=?",(aid,))
-        print(f'AI assessment error aid={aid}: {type(e).__name__}: {e}',flush=True)
+        print(f'AI assessment error aid={aid}: type={type(e).__name__} detail={_safe_log_text(e)}',flush=True)
         await send(
             chat,
             '⚠️ Під час автоматичного оцінювання сталася технічна помилка.\n\n'
@@ -520,7 +565,7 @@ async def handle_message(msg):
         )
         await send_start_welcome(chat,welcome); return
     if text=='/help':
-        await send(chat,'AI Maturity Bot — v0.3.9\n\n/new — нове оцінювання\n/status — стан\n/log — журнал\n/report [ID] — короткий звіт\n/pdf [ID] — PDF\n/xlsx [ID] — Excel\n/bundle [ID] — пакет\n/drive [ID] — архівувати пакет\n/export [ID] — JSON audit log\n/cancel — скасувати'); return
+        await send(chat,'AI Maturity Bot — v0.4.0\n\n/new — нове оцінювання\n/status — стан\n/log — журнал\n/report [ID] — короткий звіт\n/pdf [ID] — PDF\n/xlsx [ID] — Excel\n/bundle [ID] — пакет\n/drive [ID] — архівувати пакет\n/export [ID] — JSON audit log\n/cancel — скасувати'); return
     if text in ('/new','▶️ Розпочати оцінювання'): await start_assessment(chat,user); return
     if text=='/cancel':
         with db() as c: a=c.execute("SELECT id FROM assessments WHERE chat_id=? AND status NOT IN ('finished','cancelled') ORDER BY id DESC LIMIT 1",(chat,)).fetchone();
@@ -632,6 +677,13 @@ async def process_update(upd):
 async def main():
     import asyncio
     init_db()
+    print(
+        'Startup config: '
+        f'OPENAI_API_KEY={"set" if bool(OPENAI_API_KEY) else "missing"}; '
+        f'OPENAI_MODEL={OPENAI_MODEL or "missing"}; '
+        f'GDRIVE_UPLOAD={"configured" if bool(GDRIVE_UPLOAD_URL and GDRIVE_UPLOAD_SECRET) else "not-configured"}',
+        flush=True
+    )
     await configure_telegram_ui()
     offset=0
     while True:

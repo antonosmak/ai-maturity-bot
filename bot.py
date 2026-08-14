@@ -63,6 +63,18 @@ def _safe_log_text(value):
     s=re.sub(r'(?i)(Bearer\s+)[^\s\'\"]+',r'\1***REDACTED***',s)
     return s
 
+
+def _diag(stage, aid=None, **kwargs):
+    parts=[f'[AI-DIAG] stage={stage}']
+    if aid is not None:
+        parts.append(f'aid={aid}')
+    for k,v in kwargs.items():
+        # Never log credentials or authorization headers.
+        if any(x in k.lower() for x in ('key','token','secret','authorization')):
+            continue
+        parts.append(f'{k}={_safe_log_text(v)}')
+    print(' '.join(parts), flush=True)
+
 def db():
     DB_PATH.parent.mkdir(parents=True,exist_ok=True); c=sqlite3.connect(DB_PATH); c.row_factory=sqlite3.Row; return c
 
@@ -146,7 +158,7 @@ async def configure_telegram_ui():
                 'для комплексного оцінювання AI-зрілості органів публічної влади. '
                 'Автоматичний аналіз виконується на основі офіційного вебсайту та відкритих джерел. '
                 'Результат є лише експериментальною оцінкою в межах розробки та апробації методики '
-                'і не є офіційною оцінкою діяльності органу. /start — розпочати. '
+                'і не є офіційною оцінкою діяльності органу. Для початку роботи: /start — розпочати оцінювання. '
                 '©2026, Антон Осьмак'
             )
         })
@@ -258,14 +270,17 @@ def _json_from_model_text(s):
 
 async def ai_assess(aid,organization,url):
     provider=AI_PROVIDER
+    _diag('start',aid,provider=provider,organization=organization,url=url)
     if provider=='groq':
         if not GROQ_API_KEY:
             raise RuntimeError('Для Groq потрібно задати GROQ_API_KEY у Render.')
         model=GROQ_MODEL or 'openai/gpt-oss-120b'
+        _diag('provider_ready',aid,provider=provider,model=model)
     elif provider=='openai':
         if not OPENAI_API_KEY or not OPENAI_MODEL:
             raise RuntimeError('Для OpenAI потрібно задати OPENAI_API_KEY та OPENAI_MODEL у Render.')
         model=OPENAI_MODEL
+        _diag('provider_ready',aid,provider=provider,model=model)
     else:
         raise RuntimeError(f'Невідомий AI_PROVIDER: {provider}')
 
@@ -367,9 +382,11 @@ async def ai_assess(aid,organization,url):
         'Content-Type':'application/json'
     }
 
+    _diag('request_send',aid,provider=provider,model=model,endpoint=endpoint)
     try:
         async with httpx.AsyncClient(timeout=300,follow_redirects=True) as c:
             resp=await c.post(endpoint,headers=headers,json=payload)
+        _diag('response_received',aid,provider=provider,status=resp.status_code,request_id=resp.headers.get('x-request-id',''),content_type=resp.headers.get('content-type',''))
     except Exception as e:
         safe=_safe_log_text(e)
         print(f'{provider} transport error: type={type(e).__name__} detail={safe}',flush=True)
@@ -380,9 +397,19 @@ async def ai_assess(aid,organization,url):
         rid=resp.headers.get('x-request-id','')
         print(f'{provider} API error: status={resp.status_code} request_id={rid} body={body}',flush=True)
         raise RuntimeError(f'AI-провайдер {provider} повернув HTTP {resp.status_code}.')
-    data=resp.json()
+    try:
+        data=resp.json()
+        _diag('json_parsed',aid,provider=provider,top_keys=','.join(list(data.keys())[:20]) if isinstance(data,dict) else type(data).__name__)
+    except Exception as e:
+        _diag('json_parse_error',aid,provider=provider,error_type=type(e).__name__,detail=str(e),body_preview=resp.text[:1200])
+        raise RuntimeError(f'AI-провайдер {provider} повернув некоректну JSON-відповідь.') from None
 
-    model_text=_response_output_text(data)
+    try:
+        model_text=_response_output_text(data)
+        _diag('output_text_extracted',aid,chars=len(model_text or ''),preview=(model_text or '')[:350])
+    except Exception as e:
+        _diag('output_extract_error',aid,error_type=type(e).__name__,detail=str(e))
+        raise
     obj=_json_from_model_text(model_text)
     allowed={x['code'] for x in MATRIX}
     saved=0
@@ -458,7 +485,7 @@ async def run_ai_stage(chat,aid):
         # A failed AI run is closed so the user can immediately start again.
         with db() as c:
             c.execute("UPDATE assessments SET status='cancelled' WHERE id=?",(aid,))
-        print(f'AI assessment error aid={aid}: type={type(e).__name__} detail={_safe_log_text(e)}',flush=True)
+        print(f'[AI-DIAG] stage=assessment_failed aid={aid}: type={type(e).__name__} detail={_safe_log_text(e)}',flush=True)
         await send(
             chat,
             '⚠️ Під час автоматичного оцінювання сталася технічна помилка.\n\n'
@@ -592,13 +619,11 @@ async def handle_message(msg):
             'Важливо: результати мають експериментальний характер і формуються '
             'в межах розробки та апробації методики оцінювання AI-зрілості органів '
             'публічної влади. Вони не є офіційною оцінкою діяльності органу.\n\n'
-            'Для початку натисніть кнопку «Розпочати оцінювання».\n'
-            '/start — розпочати\n\n'
             '©2026, Антон Осьмак'
         )
         await send_start_welcome(chat,welcome); return
     if text=='/help':
-        await send(chat,'AI Maturity Bot — v0.4.1\n\n/new — нове оцінювання\n/status — стан\n/log — журнал\n/report [ID] — короткий звіт\n/pdf [ID] — PDF\n/xlsx [ID] — Excel\n/bundle [ID] — пакет\n/drive [ID] — архівувати пакет\n/export [ID] — JSON audit log\n/cancel — скасувати'); return
+        await send(chat,'AI Maturity Bot — v0.4.2 diagnostic\n\n/new — нове оцінювання\n/status — стан\n/log — журнал\n/report [ID] — короткий звіт\n/pdf [ID] — PDF\n/xlsx [ID] — Excel\n/bundle [ID] — пакет\n/drive [ID] — архівувати пакет\n/export [ID] — JSON audit log\n/cancel — скасувати'); return
     if text in ('/new','▶️ Розпочати оцінювання'): await start_assessment(chat,user); return
     if text=='/cancel':
         with db() as c: a=c.execute("SELECT id FROM assessments WHERE chat_id=? AND status NOT IN ('finished','cancelled') ORDER BY id DESC LIMIT 1",(chat,)).fetchone();

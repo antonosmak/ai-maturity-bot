@@ -38,7 +38,7 @@ def index():
         "service": "AI Maturity Telegram Bot",
         "status": "ok",
         "mode": "webhook",
-        "version": "0.4.7",
+        "version": "1.0.1 FINAL",
     })
 
 

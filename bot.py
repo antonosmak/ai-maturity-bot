@@ -178,6 +178,27 @@ def mode_keyboard(aid): return [[{'text':'🤖 Повністю автомати
 def score_keyboard(aid,idx): return [[{'text':str(s),'callback_data':f'score:{aid}:{idx}:{s}'} for s in range(6)]]
 def validation_keyboard(aid): return [[{'text':str(s),'callback_data':f'valid:{aid}:{s}'} for s in range(1,6)]]
 
+def is_representative(aid):
+    # Methodological threshold: at least 2/3 of 48 markers must be determined.
+    return len(calc_results(aid)['scores']) >= 32
+
+def nonrepresentative_text(aid):
+    r=calc_results(aid)
+    n=len(r['scores'])
+    return (
+        '⚠️ УВАГА! Результат оцінювання є нерепрезентативним через недостатність '
+        'доступної інформації за маркерами дослідження. Визначено менше 2/3 '
+        f'параметрів методики ({n}/48; {r["coverage"]:.1f}%). Отриманий інтегральний '
+        'показник не може розглядатися як достатньо обґрунтована оцінка AI-зрілості '
+        'органу публічної влади.'
+    )
+
+def alternative_mode_keyboard(aid):
+    return [
+        [{'text':'🤖 Автоматичний режим','callback_data':f'altmode:{aid}:ai'}],
+        [{'text':'👤 Ручний режим','callback_data':f'altmode:{aid}:manual'}]
+    ]
+
 def repeat_keyboard(aid):
     return [[{'text':'🔄 Повторити оцінювання','callback_data':f'repeat:{aid}'}]]
 
@@ -743,7 +764,8 @@ async def run_ai_stage(chat,aid,resume=False):
             '⏸ Досягнуто тимчасового безкоштовного ліміту AI-провайдера. '
             'Уже отримані результати збережено, оцінювання не скасовано.'
             f'{hint}\n\n'
-            'Після відновлення ліміту натисніть кнопку нижче — аналіз продовжиться '
+            'Варто зачекати декілька хвилин для відновлення ліміту та натиснути '
+            'кнопку нижче — аналіз продовжиться '
             f'з блоку {e.dimension}.',
             resume_ai_keyboard(aid)
         )
@@ -793,11 +815,45 @@ def make_radar(aid,org):
     out=BASE_DIR/'exports'/f'radar_{aid}.png'; out.parent.mkdir(parents=True,exist_ok=True); fig.savefig(out,dpi=180,bbox_inches='tight'); plt.close(fig); return out
 
 async def finish_assessment(chat,aid):
-    with db() as c: a=c.execute('SELECT * FROM assessments WHERE id=?',(aid,)).fetchone(); c.execute("UPDATE assessments SET status='await_validation',finished_at=?,coverage=? WHERE id=?",(now_iso(),calc_results(aid)['coverage'],aid))
-    r=calc_results(aid); chart=make_radar(aid,a['organization'] or 'Орган'); await send_photo(chat,chart,'Профіль AI-зрілості')
-    dims='\n'.join(f"{d}: {r['dims'][d]:.1f}%" if r['dims'][d] is not None else f'{d}: не визначено' for d,_ in DIMENSIONS)
-    await send(chat,f"Оцінювання №{aid} завершено.\nОрган: {a['organization']}\nРежим: {MODE_LABEL.get(a['mode'],a['mode'])}\nAIMI: {r['aimi']:.1f}%\nПовнота: {r['coverage']:.1f}% ({len(r['scores'])}/48)\nРівень: {maturity_level(r['aimi'])}\n\n{dims}")
-    await send(chat,'Наскільки отриманий профіль відповідає фактичному стану органу?\n1 — зовсім не відповідає; 5 — повністю відповідає.',validation_keyboard(aid))
+    with db() as c:
+        a=c.execute('SELECT * FROM assessments WHERE id=?',(aid,)).fetchone()
+        c.execute(
+            "UPDATE assessments SET status='await_validation',finished_at=?,coverage=? WHERE id=?",
+            (now_iso(),calc_results(aid)['coverage'],aid)
+        )
+    r=calc_results(aid)
+    representative=is_representative(aid)
+    chart=make_radar(aid,a['organization'] or 'Орган')
+    await send_photo(chat,chart,'Профіль AI-зрілості')
+    dims='\n'.join(
+        f"{d}: {r['dims'][d]:.1f}%" if r['dims'][d] is not None else f'{d}: не визначено'
+        for d,_ in DIMENSIONS
+    )
+    aimi_label='AIMI' if representative else 'AIMI (нерепрезентативний результат)'
+    level_label=maturity_level(r['aimi']) if representative else f"{maturity_level(r['aimi'])} — результат нерепрезентативний"
+    await send(
+        chat,
+        f"Оцінювання №{aid} завершено.\n"
+        f"Орган: {a['organization']}\n"
+        f"Режим: {MODE_LABEL.get(a['mode'],a['mode'])}\n"
+        f"{aimi_label}: {r['aimi']:.1f}%\n"
+        f"Повнота: {r['coverage']:.1f}% ({len(r['scores'])}/48)\n"
+        f"Рівень: {level_label}\n\n{dims}"
+    )
+    if not representative:
+        await send(chat,nonrepresentative_text(aid))
+        await send(
+            chat,
+            'Для отримання більш повної та репрезентативної оцінки рекомендується '
+            'повторити оцінювання в іншому режимі — автоматичному або ручному.',
+            alternative_mode_keyboard(aid)
+        )
+    await send(
+        chat,
+        'Наскільки отриманий профіль відповідає фактичному стану органу?\n'
+        '1 — зовсім не відповідає; 5 — повністю відповідає.',
+        validation_keyboard(aid)
+    )
 
 def base_recommendations(aid):
     r=calc_results(aid); ranked=sorted([(d,v) for d,v in r['dims'].items() if v is not None],key=lambda x:x[1]); return 'ПРІОРИТЕТНІ НАПРЯМИ\n'+'\n'.join(f'{i}. {d}: {v:.1f}% — потребує пріоритетного опрацювання.' for i,(d,v) in enumerate(ranked[:4],1))
@@ -816,8 +872,18 @@ def _fonts():
         return 'DejaVu','DejaVuBold'
     return 'Helvetica','Helvetica-Bold'
 
+def safe_filename_part(value, max_len=90):
+    """Create a filesystem-safe readable filename fragment from organization name."""
+    value=(value or '').strip()
+    value=re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', value)
+    value=re.sub(r'\s+', ' ', value).strip(' ._-')
+    if not value:
+        return 'Орган_публічної_влади'
+    value=value[:max_len].rstrip(' ._-')
+    return value.replace(' ', '_')
+
 def export_pdf(aid):
-    a,ans,r=_payload(aid); out=BASE_DIR/'exports'/f'AI_Maturity_Assessment_{aid}.pdf'; out.parent.mkdir(parents=True,exist_ok=True); font,bold=_fonts(); st=getSampleStyleSheet(); st.add(ParagraphStyle(name='U',parent=st['BodyText'],fontName=font,fontSize=8.5,leading=11)); st.add(ParagraphStyle(name='H',parent=st['Heading2'],fontName=bold,fontSize=13)); st.add(ParagraphStyle(name='T',parent=st['Title'],fontName=bold,fontSize=17,alignment=TA_CENTER))
+    a,ans,r=_payload(aid); org_file=safe_filename_part(a.get('organization')); out=BASE_DIR/'exports'/f'AI_Maturity_Assessment_{org_file}_{aid}.pdf'; out.parent.mkdir(parents=True,exist_ok=True); font,bold=_fonts(); st=getSampleStyleSheet(); st.add(ParagraphStyle(name='U',parent=st['BodyText'],fontName=font,fontSize=8.5,leading=11)); st.add(ParagraphStyle(name='H',parent=st['Heading2'],fontName=bold,fontSize=13)); st.add(ParagraphStyle(name='T',parent=st['Title'],fontName=bold,fontSize=17,alignment=TA_CENTER))
     def draw_footer(canvas,doc):
         canvas.saveState()
         canvas.setFont(font,6.1)
@@ -829,8 +895,16 @@ def export_pdf(aid):
         canvas.drawCentredString(A4[0]/2,4.0*mm,line3)
         canvas.restoreState()
     doc=SimpleDocTemplate(str(out),pagesize=A4,rightMargin=12*mm,leftMargin=12*mm,topMargin=12*mm,bottomMargin=21*mm); story=[Paragraph('AI Maturity Assessment',st['T']),Paragraph('Звіт за результатами оцінювання AI-зрілості органу публічної влади',st['H'])]
-    meta=[['Орган',a.get('organization') or ''],['Офіційний сайт',a.get('official_url') or '—'],['Режим оцінювання',MODE_LABEL.get(a.get('mode'),a.get('mode') or '—')],['AIMI',f"{r['aimi']:.1f}%"],['Повнота оцінювання',f"{r['coverage']:.1f}% ({len(r['scores'])}/48)"],['Рівень',maturity_level(r['aimi'])]]
+    representative=is_representative(aid)
+    aimi_pdf_label='AIMI' if representative else 'AIMI (нерепрезентативний результат)'
+    level_pdf=maturity_level(r['aimi']) if representative else f"{maturity_level(r['aimi'])} — результат нерепрезентативний"
+    meta=[['Орган',a.get('organization') or ''],['Офіційний сайт',a.get('official_url') or '—'],['Режим оцінювання',MODE_LABEL.get(a.get('mode'),a.get('mode') or '—')],[aimi_pdf_label,f"{r['aimi']:.1f}%"],['Повнота оцінювання',f"{r['coverage']:.1f}% ({len(r['scores'])}/48)"],['Рівень',level_pdf]]
     t=Table([[Paragraph(str(v),st['U']) for v in row] for row in meta],colWidths=[45*mm,135*mm]); t.setStyle(TableStyle([('GRID',(0,0),(-1,-1),.4,colors.grey),('FONTNAME',(0,0),(-1,-1),font),('FONTNAME',(0,0),(0,-1),bold),('VALIGN',(0,0),(-1,-1),'TOP')])); story += [t,Spacer(1,5*mm)]
+    if not representative:
+        warning=nonrepresentative_text(aid).replace('⚠️ ','')
+        wt=Table([[Paragraph('<b>'+warning+'</b>',st['U'])]],colWidths=[180*mm])
+        wt.setStyle(TableStyle([('BOX',(0,0),(-1,-1),1,colors.black),('LEFTPADDING',(0,0),(-1,-1),6),('RIGHTPADDING',(0,0),(-1,-1),6),('TOPPADDING',(0,0),(-1,-1),6),('BOTTOMPADDING',(0,0),(-1,-1),6)]))
+        story += [wt,Spacer(1,3*mm),Paragraph('Рекомендується повторити оцінювання в іншому режимі — автоматичному або ручному — для підвищення повноти інформації за маркерами дослідження.',st['U']),Spacer(1,4*mm)]
     if a.get('mode')=='ai': story.append(Paragraph('Примітка: це ШІ-аналіз на основі офіційного вебсайту органу та відкритих джерел із використанням вебпошуку. Показники, для яких не знайдено достатньої доказової інформації, позначено «не визначено».',st['U']))
     elif a.get('mode')=='hybrid': story.append(Paragraph('Примітка: це ШІ-аналіз з підкріпленням. Первинне оцінювання виконано ШІ на основі офіційного вебсайту органу та відкритих джерел із використанням вебпошуку; показники, для яких не знайдено достатньої доказової інформації, додатково уточнено респондентом.',st['U']))
     elif a.get('mode')=='manual': story.append(Paragraph('Примітка: оцінювання виконано в ручному режимі на основі відповідей респондента.',st['U']))
@@ -892,7 +966,7 @@ async def handle_message(msg):
         )
         await send_start_welcome(chat,welcome); return
     if text=='/help':
-        await send(chat,'AI Maturity Bot — v0.4.7\n\n/new — нове оцінювання\n/status — стан\n/log — журнал\n/report [ID] — короткий звіт\n/pdf [ID] — PDF\n/xlsx [ID] — Excel\n/bundle [ID] — пакет\n/drive [ID] — архівувати пакет\n/export [ID] — JSON audit log\n/cancel — скасувати'); return
+        await send(chat,'AI Maturity Bot — v1.0.1 FINAL\n\n/new — нове оцінювання\n/status — стан\n/log — журнал\n/report [ID] — короткий звіт\n/pdf [ID] — PDF\n/xlsx [ID] — Excel\n/bundle [ID] — пакет\n/drive [ID] — архівувати пакет\n/export [ID] — JSON audit log\n/cancel — скасувати'); return
     if text in ('/new','▶️ Розпочати оцінювання'): await start_assessment(chat,user); return
     if text=='/cancel':
         with db() as c: a=c.execute("SELECT id FROM assessments WHERE chat_id=? AND status NOT IN ('finished','cancelled') ORDER BY id DESC LIMIT 1",(chat,)).fetchone();
@@ -983,6 +1057,39 @@ async def handle_callback(cb):
     if p[0]=='errorhome' and len(p)==2:
         # Failed assessment is already cancelled; create a fresh start screen.
         await start_assessment(chat,cb.get('from',{}))
+        return
+    if p[0]=='altmode' and len(p)==3:
+        old_aid=int(p[1]); mode=p[2]
+        if mode not in ('ai','manual'):
+            return
+        with db() as c:
+            old=c.execute(
+                'SELECT * FROM assessments WHERE id=? AND chat_id=?',
+                (old_aid,chat)
+            ).fetchone()
+            if not old:
+                await send(chat,'Оцінювання не знайдено.')
+                return
+            # Preserve the old result in the journal, but allow a new independent assessment.
+            c.execute(
+                "UPDATE assessments SET status='finished' WHERE id=? AND status NOT IN ('finished','cancelled')",
+                (old_aid,)
+            )
+            cur=c.execute(
+                'INSERT INTO assessments(chat_id,user_id,username,mode,status,created_at) VALUES(?,?,?,?,?,?)',
+                (
+                    chat,
+                    (cb.get('from') or {}).get('id'),
+                    (cb.get('from') or {}).get('username'),
+                    mode,'await_org',now_iso()
+                )
+            )
+            new_aid=cur.lastrowid
+        await send(
+            chat,
+            f'Створено нове оцінювання №{new_aid}. Обрано: {MODE_LABEL[mode]}.\n\n'
+            'Надішліть повну назву органу публічної влади.'
+        )
         return
     if p[0]=='repeat' and len(p)==2:
         # Нове незалежне оцінювання; попередній результат залишається в журналі.

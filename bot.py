@@ -90,6 +90,26 @@ async def send_start_welcome(chat,text):
         }
     }
     await tg('sendMessage',p)
+
+async def configure_telegram_ui():
+    # Persistent Telegram command menu. It remains available even when the
+    # message history is cleared, unlike a reply keyboard that only appears
+    # after the bot has sent a message.
+    commands=[
+        {'command':'start','description':'Старт / головний екран'},
+        {'command':'new','description':'Розпочати нове оцінювання'},
+        {'command':'status','description':'Стан поточного оцінювання'},
+        {'command':'log','description':'Журнал оцінювань'},
+        {'command':'help','description':'Довідка'}
+    ]
+    try:
+        await tg('setMyCommands',{'commands':commands})
+        await tg('setChatMenuButton',{'menu_button':{'type':'commands'}})
+        print('Telegram command menu configured',flush=True)
+    except Exception as e:
+        # The bot itself must still start even if Telegram temporarily rejects
+        # a UI configuration call.
+        print('Telegram UI configuration warning:',repr(e),flush=True)
 async def send_document(chat,path,caption=''):
     with path.open('rb') as f: await tg('sendDocument',{'chat_id':str(chat),'caption':caption},{'document':(path.name,f,mimetypes.guess_type(path.name)[0] or 'application/octet-stream')})
 async def send_photo(chat,path,caption=''):
@@ -366,8 +386,8 @@ async def run_ai_stage(chat,aid):
         print(f'AI assessment error aid={aid}: {type(e).__name__}: {e}',flush=True)
         await send(
             chat,
-            '⚠️ Під час оцінювання сталася помилка.\n\n'
-            f'{type(e).__name__}: {e}\n\n'
+            '⚠️ Під час автоматичного оцінювання сталася технічна помилка.\n\n'
+            'Оцінювання не завершено. Спробуйте повторити пізніше або оберіть інший режим.\n\n'
             'Натисніть кнопку нижче, щоб повернутися на стартовий екран.',
             error_home_keyboard(aid)
         )
@@ -500,7 +520,7 @@ async def handle_message(msg):
         )
         await send_start_welcome(chat,welcome); return
     if text=='/help':
-        await send(chat,'AI Maturity Bot — v0.3.8\n\n/new — нове оцінювання\n/status — стан\n/log — журнал\n/report [ID] — короткий звіт\n/pdf [ID] — PDF\n/xlsx [ID] — Excel\n/bundle [ID] — пакет\n/drive [ID] — архівувати пакет\n/export [ID] — JSON audit log\n/cancel — скасувати'); return
+        await send(chat,'AI Maturity Bot — v0.3.9\n\n/new — нове оцінювання\n/status — стан\n/log — журнал\n/report [ID] — короткий звіт\n/pdf [ID] — PDF\n/xlsx [ID] — Excel\n/bundle [ID] — пакет\n/drive [ID] — архівувати пакет\n/export [ID] — JSON audit log\n/cancel — скасувати'); return
     if text in ('/new','▶️ Розпочати оцінювання'): await start_assessment(chat,user); return
     if text=='/cancel':
         with db() as c: a=c.execute("SELECT id FROM assessments WHERE chat_id=? AND status NOT IN ('finished','cancelled') ORDER BY id DESC LIMIT 1",(chat,)).fetchone();
@@ -611,7 +631,9 @@ async def process_update(upd):
 
 async def main():
     import asyncio
-    init_db(); offset=0
+    init_db()
+    await configure_telegram_ui()
+    offset=0
     while True:
         try:
             ups=await tg('getUpdates',{'offset':offset,'timeout':POLL_TIMEOUT,'allowed_updates':['message','callback_query']})

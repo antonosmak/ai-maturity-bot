@@ -254,19 +254,162 @@ def _response_output_text(data):
                 chunks.append(str(c['text']))
     return '\n'.join(chunks).strip()
 
-def _json_from_model_text(s):
-    """Accept a plain JSON object or JSON wrapped in a markdown fence."""
-    s=(s or '').strip()
+def _strip_json_fences(s):
+    s=(s or '').strip().lstrip('\ufeff')
     if s.startswith('```'):
         s=re.sub(r'^```(?:json)?\s*','',s,flags=re.I)
         s=re.sub(r'\s*```$','',s)
-    try:
-        return json.loads(s)
-    except Exception:
-        m=re.search(r'\{.*\}',s,re.S)
+    return s.strip()
+
+def _repair_json_text(s):
+    """Repair common LLM JSON defects without changing field values."""
+    s=_strip_json_fences(s)
+    # Normalize smart quotes only when they are used as JSON delimiters.
+    s=s.replace('\u201c','"').replace('\u201d','"')
+    # Remove ASCII control characters except whitespace accepted by JSON.
+    s=''.join(ch for ch in s if ord(ch)>=32 or ch in '\n\r\t')
+    # Remove trailing commas.
+    s=re.sub(r',\s*([}\]])',r'\1',s)
+    # Common missing comma between adjacent objects in an array.
+    s=re.sub(r'}\s*(?={)',r'},',s)
+    # Common missing comma between a closed value/container and the next JSON key.
+    s=re.sub(r'([}\]"\d])\s*\n\s*(?="(?:research_note|code|score|evidence|rationale|confidence|sources)"\s*:)',r'\1,',s)
+    return s
+
+def _balanced_objects_from_items(s):
+    """Return top-level {...} objects located inside the items array."""
+    m=re.search(r'"items"\s*:\s*\[',s,re.I)
+    if not m:
+        return []
+    i=m.end()
+    depth=0
+    in_string=False
+    escape=False
+    obj_start=None
+    out=[]
+    while i < len(s):
+        ch=s[i]
+        if in_string:
+            if escape:
+                escape=False
+            elif ch=='\\':
+                escape=True
+            elif ch=='"':
+                in_string=False
+        else:
+            if ch=='"':
+                in_string=True
+            elif ch=='{':
+                if depth==0:
+                    obj_start=i
+                depth+=1
+            elif ch=='}':
+                if depth>0:
+                    depth-=1
+                    if depth==0 and obj_start is not None:
+                        out.append(s[obj_start:i+1])
+                        obj_start=None
+            elif ch==']' and depth==0:
+                break
+        i+=1
+    return out
+
+def _regex_item_fallback(raw):
+    """Last-resort extraction of core fields from one malformed item."""
+    def sval(name):
+        m=re.search(r'"'+re.escape(name)+r'"\s*:\s*"((?:\\.|[^"\\])*)"',raw,re.S)
         if not m:
-            raise RuntimeError('ШІ не повернув структурований JSON-результат.')
-        return json.loads(m.group(0))
+            return ''
+        try:
+            return json.loads('"'+m.group(1)+'"')
+        except Exception:
+            return m.group(1).replace('\\"','"')
+    code=sval('code')
+    sm=re.search(r'"score"\s*:\s*(null|-?\d+)',raw,re.I)
+    score=None if not sm or sm.group(1).lower()=='null' else int(sm.group(1))
+    cm=re.search(r'"confidence"\s*:\s*(null|0(?:\.\d+)?|1(?:\.0+)?)',raw,re.I)
+    confidence=None if not cm or cm.group(1).lower()=='null' else float(cm.group(1))
+    if not code:
+        return None
+    return {
+        'code':code,
+        'score':score,
+        'evidence':sval('evidence'),
+        'rationale':sval('rationale'),
+        'confidence':confidence,
+        'sources':[]
+    }
+
+def _json_from_model_text(s):
+    """
+    Parse model JSON defensively.
+    Returns an object even when one malformed comma would otherwise invalidate
+    the whole D1–D8 response. Valid individual items are salvaged.
+    """
+    original=_strip_json_fences(s)
+
+    # 1. Strict JSON.
+    try:
+        obj=json.loads(original)
+        if isinstance(obj,dict):
+            obj['_parse_mode']='strict'
+        return obj
+    except Exception:
+        pass
+
+    # 2. Repaired full JSON.
+    candidate=original
+    m=re.search(r'\{.*\}',candidate,re.S)
+    if m:
+        candidate=m.group(0)
+    repaired=_repair_json_text(candidate)
+    try:
+        obj=json.loads(repaired)
+        if isinstance(obj,dict):
+            obj['_parse_mode']='repaired'
+        return obj
+    except Exception:
+        pass
+
+    # 3. Salvage valid top-level objects from "items".
+    item_raws=_balanced_objects_from_items(repaired)
+    items=[]
+    failed=0
+    for raw in item_raws:
+        parsed=None
+        for variant in (raw,_repair_json_text(raw)):
+            try:
+                parsed=json.loads(variant)
+                break
+            except Exception:
+                parsed=None
+        if not isinstance(parsed,dict):
+            parsed=_regex_item_fallback(raw)
+        if isinstance(parsed,dict) and parsed.get('code'):
+            items.append(parsed)
+        else:
+            failed+=1
+
+    if items:
+        note_match=re.search(
+            r'"research_note"\s*:\s*"((?:\\.|[^"\\])*)"',
+            repaired,re.S
+        )
+        note=''
+        if note_match:
+            try:
+                note=json.loads('"'+note_match.group(1)+'"')
+            except Exception:
+                note=note_match.group(1)
+        return {
+            'items':items,
+            'research_note':note,
+            '_parse_mode':'salvaged',
+            '_salvaged_items':len(items),
+            '_failed_items':failed
+        }
+
+    raise RuntimeError('ШІ повернув JSON, який не вдалося відновити або частково розібрати.')
 
 
 def _criteria_batches():
@@ -432,12 +575,24 @@ JSON:
 
         try:
             obj=_json_from_model_text(model_text)
+            parse_mode=obj.get('_parse_mode','unknown') if isinstance(obj,dict) else 'unknown'
             _diag('assessment_json_parsed',aid,batch=batch_no,dimension=dim,
+                  parse_mode=parse_mode,
+                  salvaged=obj.get('_salvaged_items','') if isinstance(obj,dict) else '',
+                  failed=obj.get('_failed_items','') if isinstance(obj,dict) else '',
                   keys=','.join(list(obj.keys())[:20]) if isinstance(obj,dict) else '')
         except Exception as e:
+            # A malformed D-block must not destroy the entire assessment.
+            # Leave this block as "not determined" and continue with the next one.
             _diag('assessment_json_error',aid,batch=batch_no,dimension=dim,
                   error_type=type(e).__name__,detail=str(e),text_preview=(model_text or '')[:1000])
-            raise
+            notes.append(f'{dim}: відповідь ШІ не вдалося структуровано розібрати; показники залишено невизначеними.')
+            if chat_id:
+                await send(chat_id,f'ШІ-аналіз: {dim} отримано, але частину результатів не вдалося структуровано розібрати. Переходжу до наступного блоку.')
+            if provider=='groq' and batch_no < len(batches):
+                _diag('rate_limit_pause',aid,seconds=65,next_batch=batch_no+1)
+                await asyncio.sleep(65)
+            continue
 
         saved_this=0
         with db() as c:
@@ -485,8 +640,11 @@ JSON:
 
         total_saved+=saved_this
         note=str(obj.get('research_note') or '').strip()
+        parse_mode=str(obj.get('_parse_mode') or 'unknown')
         if note:
-            notes.append(f'{dim}: {note}')
+            notes.append(f'{dim} [{parse_mode}]: {note}')
+        elif parse_mode!='strict':
+            notes.append(f'{dim}: JSON оброблено в режимі {parse_mode}.')
         _diag('batch_saved',aid,batch=batch_no,dimension=dim,saved=saved_this,total_saved=total_saved)
 
         if chat_id:
@@ -667,7 +825,7 @@ async def handle_message(msg):
         )
         await send_start_welcome(chat,welcome); return
     if text=='/help':
-        await send(chat,'AI Maturity Bot — v0.4.4\n\n/new — нове оцінювання\n/status — стан\n/log — журнал\n/report [ID] — короткий звіт\n/pdf [ID] — PDF\n/xlsx [ID] — Excel\n/bundle [ID] — пакет\n/drive [ID] — архівувати пакет\n/export [ID] — JSON audit log\n/cancel — скасувати'); return
+        await send(chat,'AI Maturity Bot — v0.4.5\n\n/new — нове оцінювання\n/status — стан\n/log — журнал\n/report [ID] — короткий звіт\n/pdf [ID] — PDF\n/xlsx [ID] — Excel\n/bundle [ID] — пакет\n/drive [ID] — архівувати пакет\n/export [ID] — JSON audit log\n/cancel — скасувати'); return
     if text in ('/new','▶️ Розпочати оцінювання'): await start_assessment(chat,user); return
     if text=='/cancel':
         with db() as c: a=c.execute("SELECT id FROM assessments WHERE chat_id=? AND status NOT IN ('finished','cancelled') ORDER BY id DESC LIMIT 1",(chat,)).fetchone();

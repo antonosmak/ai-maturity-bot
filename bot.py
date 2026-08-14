@@ -1,738 +1,318 @@
 from __future__ import annotations
-
-import asyncio
-import base64
-import json
-import os
-import sqlite3
-import tempfile
-import textwrap
-import zipfile
-import mimetypes
+import base64, json, mimetypes, os, re, sqlite3, tempfile, textwrap, zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-
+from urllib.parse import urljoin, urlparse
 import httpx
 import matplotlib.pyplot as plt
 import numpy as np
 import xlsxwriter
+from bs4 import BeautifulSoup
 from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER, TA_LEFT
-from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.enums import TA_CENTER
+from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak, KeepTogether
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak
 
-BASE_DIR = Path(__file__).resolve().parent
-MATRIX = json.loads((BASE_DIR / "matrix.json").read_text(encoding="utf-8"))
-DIMENSIONS = []
-for item in MATRIX:
-    if item["dimension"] not in [d[0] for d in DIMENSIONS]:
-        DIMENSIONS.append((item["dimension"], item["dimension_name"]))
+BASE_DIR=Path(__file__).resolve().parent
+MATRIX=json.loads((BASE_DIR/'matrix.json').read_text(encoding='utf-8'))
+DIMENSIONS=[]
+for x in MATRIX:
+    if x['dimension'] not in [d[0] for d in DIMENSIONS]: DIMENSIONS.append((x['dimension'],x['dimension_name']))
+TOKEN=os.getenv('TELEGRAM_BOT_TOKEN','').strip(); OPENAI_API_KEY=os.getenv('OPENAI_API_KEY','').strip(); OPENAI_MODEL=os.getenv('OPENAI_MODEL','').strip()
+GDRIVE_UPLOAD_URL=os.getenv('GDRIVE_UPLOAD_URL','').strip(); GDRIVE_UPLOAD_SECRET=os.getenv('GDRIVE_UPLOAD_SECRET','').strip()
+DB_PATH=Path(os.getenv('DB_PATH',str(BASE_DIR/'data'/'ai_maturity.db'))); POLL_TIMEOUT=int(os.getenv('POLL_TIMEOUT','30'))
+if not TOKEN: raise SystemExit('Не задано TELEGRAM_BOT_TOKEN')
+API=f'https://api.telegram.org/bot{TOKEN}'
+SCALE={0:'Відсутність',1:'Початковий',2:'Фрагментарний',3:'Системний',4:'Інтегрований',5:'Трансформаційний'}
+MODE_LABEL={'ai':'ШІ-аналіз','hybrid':'ШІ-аналіз з підкріпленням','manual':'Ручне оцінювання'}
 
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "").strip()
-DB_PATH = Path(os.environ.get("DB_PATH", str(BASE_DIR / "data" / "ai_maturity.db")))
-POLL_TIMEOUT = int(os.environ.get("POLL_TIMEOUT", "30"))
-GDRIVE_UPLOAD_URL = os.environ.get("GDRIVE_UPLOAD_URL", "").strip()
-GDRIVE_UPLOAD_SECRET = os.environ.get("GDRIVE_UPLOAD_SECRET", "").strip()
+def db():
+    DB_PATH.parent.mkdir(parents=True,exist_ok=True); c=sqlite3.connect(DB_PATH); c.row_factory=sqlite3.Row; return c
 
-if not TOKEN:
-    raise SystemExit("Не задано TELEGRAM_BOT_TOKEN. Див. .env.example / README.md")
+def _col(c,t,n,decl):
+    cols={r['name'] for r in c.execute(f'PRAGMA table_info({t})')}
+    if n not in cols: c.execute(f'ALTER TABLE {t} ADD COLUMN {n} {decl}')
 
-API = f"https://api.telegram.org/bot{TOKEN}"
-
-SCALE = {
-    0: "Відсутність",
-    1: "Початковий",
-    2: "Фрагментарний",
-    3: "Системний",
-    4: "Інтегрований",
-    5: "Трансформаційний",
-}
-
-DIM_RECOMMENDATIONS = {
-    "D1": "Формалізувати стратегічні цілі застосування ШІ, визначити пріоритетні сценарії, ресурси та KPI публічної цінності.",
-    "D2": "Уточнити правові підстави та внутрішні правила застосування ШІ, розподіл відповідальності, документування, захист даних і механізми оскарження.",
-    "D3": "Інституціоналізувати AI Governance: визначити відповідального суб’єкта, порядок погодження AI-ініціатив, реєстр систем/сценаріїв та міжпідрозділову координацію.",
-    "D4": "Провести інвентаризацію даних, підвищити їх якість, структурованість і метадані, забезпечити API/інтероперабельність та правила життєвого циклу даних.",
-    "D5": "Підготувати ІТ-архітектуру, тестові середовища, журналювання, резервування, масштабування та безпечне виведення AI-компонентів з експлуатації.",
-    "D6": "Розгорнути диференційоване навчання з AI literacy для керівників, предметних фахівців і технічного персоналу та практики критичної перевірки результатів ШІ.",
-    "D7": "Запровадити ризик-орієнтоване оцінювання AI-систем, вимоги кібербезпеки, недискримінації, прозорості, моніторингу, аудиту та процедур припинення використання.",
-    "D8": "Формалізувати людино-машинну взаємодію: розподіл функцій, Human-in-the-Loop, право втручання, людську перевірку та персоніфіковану відповідальність.",
-}
-
-
-def db() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_db() -> None:
+def init_db():
     with db() as c:
-        c.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS assessments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER NOT NULL,
-                user_id INTEGER,
-                username TEXT,
-                organization TEXT,
-                status TEXT NOT NULL DEFAULT 'await_org',
-                current_index INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL,
-                finished_at TEXT,
-                validation_score INTEGER,
-                validation_comment TEXT,
-                recommendations TEXT
-            );
-            CREATE TABLE IF NOT EXISTS answers (
-                assessment_id INTEGER NOT NULL,
-                code TEXT NOT NULL,
-                score INTEGER NOT NULL,
-                source TEXT NOT NULL DEFAULT 'respondent',
-                evidence TEXT,
-                rationale TEXT,
-                confidence REAL,
-                created_at TEXT NOT NULL,
-                PRIMARY KEY (assessment_id, code)
-            );
-            CREATE INDEX IF NOT EXISTS idx_assess_chat ON assessments(chat_id, id DESC);
-            """
-        )
+        c.executescript('''CREATE TABLE IF NOT EXISTS assessments(id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER NOT NULL,user_id INTEGER,username TEXT,organization TEXT,status TEXT NOT NULL DEFAULT 'await_mode',current_index INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,finished_at TEXT,validation_score INTEGER,validation_comment TEXT,recommendations TEXT); CREATE TABLE IF NOT EXISTS answers(assessment_id INTEGER NOT NULL,code TEXT NOT NULL,score INTEGER NOT NULL,source TEXT NOT NULL DEFAULT 'respondent',evidence TEXT,rationale TEXT,confidence REAL,created_at TEXT NOT NULL,PRIMARY KEY(assessment_id,code));''')
+        _col(c,'assessments','mode','TEXT'); _col(c,'assessments','official_url','TEXT'); _col(c,'assessments','coverage','REAL'); _col(c,'assessments','ai_note','TEXT')
 
+def now_iso(): return datetime.now(timezone.utc).isoformat()
+def maturity_level(v):
+    return 'I — Початковий' if v<=20 else 'II — Фрагментарний' if v<=40 else 'III — Системний' if v<=60 else 'IV — Інтегрований' if v<=80 else 'V — Трансформаційний'
 
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def calc_results(aid):
+    with db() as c: rows=c.execute('SELECT code,score,source FROM answers WHERE assessment_id=?',(aid,)).fetchall()
+    scores={r['code']:int(r['score']) for r in rows}; dims={}; sums={}; counts={}; totals={}
+    for d,_ in DIMENSIONS:
+        codes=[x['code'] for x in MATRIX if x['dimension']==d]; vals=[scores[k] for k in codes if k in scores]
+        counts[d]=len(vals); totals[d]=len(codes); sums[d]=sum(vals); dims[d]=(sum(vals)/(5*len(vals))*100) if vals else None
+    n=len(scores); coverage=n/len(MATRIX)*100; vals=[v for v in dims.values() if v is not None]
+    aimi=sum(scores.values())/(5*n)*100 if n else 0
+    return {'scores':scores,'dims':dims,'sums':sums,'counts':counts,'totals':totals,'aimi':aimi,'coverage':coverage,'complete':n==len(MATRIX)}
 
+async def tg(method,payload=None,files=None):
+    async with httpx.AsyncClient(timeout=max(POLL_TIMEOUT+10,45)) as c:
+        r=await c.post(f'{API}/{method}',data=payload or {} if files else None,json=None if files else payload or {},files=files); r.raise_for_status(); j=r.json(); return j.get('result')
+async def send(chat,text,keyboard=None):
+    p={'chat_id':chat,'text':text};
+    if keyboard: p['reply_markup']={'inline_keyboard':keyboard}
+    await tg('sendMessage',p)
+async def send_document(chat,path,caption=''):
+    with path.open('rb') as f: await tg('sendDocument',{'chat_id':str(chat),'caption':caption},{'document':(path.name,f,mimetypes.guess_type(path.name)[0] or 'application/octet-stream')})
+async def send_photo(chat,path,caption=''):
+    with path.open('rb') as f: await tg('sendPhoto',{'chat_id':str(chat),'caption':caption},{'photo':(path.name,f,'image/png')})
 
-def maturity_level(aimi: float) -> str:
-    if aimi <= 20:
-        return "I — Початковий"
-    if aimi <= 40:
-        return "II — Фрагментарний"
-    if aimi <= 60:
-        return "III — Системний"
-    if aimi <= 80:
-        return "IV — Інтегрований"
-    return "V — Трансформаційний"
+def mode_keyboard(aid): return [[{'text':'🤖 Повністю автоматичний аналіз','callback_data':f'mode:{aid}:ai'}],[{'text':'🤖+👤 Аналіз з підкріпленням','callback_data':f'mode:{aid}:hybrid'}],[{'text':'👤 Ручний режим','callback_data':f'mode:{aid}:manual'}]]
+def score_keyboard(aid,idx): return [[{'text':str(s),'callback_data':f'score:{aid}:{idx}:{s}'} for s in range(6)]]
+def validation_keyboard(aid): return [[{'text':str(s),'callback_data':f'valid:{aid}:{s}'} for s in range(1,6)]]
 
-
-def calc_results(assessment_id: int) -> dict[str, Any]:
+async def start_assessment(chat,user):
     with db() as c:
-        rows = c.execute("SELECT code, score FROM answers WHERE assessment_id=?", (assessment_id,)).fetchall()
-    scores = {r["code"]: int(r["score"]) for r in rows}
-    dims: dict[str, float] = {}
-    sums: dict[str, int] = {}
-    counts: dict[str, int] = {}
-    for dim, _name in DIMENSIONS:
-        codes = [x["code"] for x in MATRIX if x["dimension"] == dim]
-        vals = [scores[c] for c in codes if c in scores]
-        sums[dim] = sum(vals)
-        counts[dim] = len(vals)
-        dims[dim] = (sum(vals) / (5 * len(codes)) * 100.0) if len(vals) == len(codes) else 0.0
-    complete = len(scores) == len(MATRIX)
-    aimi = sum(dims.values()) / 8 if complete else 0.0
-    return {"dims": dims, "sums": sums, "counts": counts, "aimi": aimi, "complete": complete, "scores": scores}
+        active=c.execute("SELECT id FROM assessments WHERE chat_id=? AND status NOT IN ('finished','cancelled') ORDER BY id DESC LIMIT 1",(chat,)).fetchone()
+        if active: await send(chat,f"У вас уже є незавершене оцінювання №{active['id']}. /cancel — скасувати."); return
+        cur=c.execute('INSERT INTO assessments(chat_id,user_id,username,status,created_at) VALUES(?,?,?,?,?)',(chat,user.get('id'),user.get('username'),'await_mode',now_iso())); aid=cur.lastrowid
+    await send(chat,'Оберіть режим оцінювання AI-зрілості органу публічної влади:',mode_keyboard(aid))
 
+async def ask_question(chat,aid,idx):
+    x=MATRIX[idx]; await send(chat,f"{idx+1}/{len(MATRIX)}  {x['code']} — {x['criterion']}\n{x['dimension_name']}\n\n{x['statement']}\n\nОцініть 0–5:",score_keyboard(aid,idx))
 
-def make_radar(assessment_id: int, organization: str) -> Path:
-    r = calc_results(assessment_id)
-    labels = [d[0] for d in DIMENSIONS]
-    values = [r["dims"][d] for d in labels]
-    vals = values + values[:1]
-    angles = np.linspace(0, 2 * np.pi, len(labels), endpoint=False).tolist()
-    angles += angles[:1]
+def missing_indices(aid):
+    r=calc_results(aid); return [i for i,x in enumerate(MATRIX) if x['code'] not in r['scores']]
 
-    fig = plt.figure(figsize=(8, 8))
-    ax = plt.subplot(111, polar=True)
-    ax.plot(angles, vals, linewidth=2)
-    ax.fill(angles, vals, alpha=0.15)
-    ax.set_thetagrids(np.degrees(angles[:-1]), labels)
-    ax.set_ylim(0, 100)
-    ax.set_yticks([20, 40, 60, 80, 100])
-    ax.set_title(f"Профіль AI-зрілості\n{organization}\nAIMI = {r['aimi']:.1f}%", pad=25)
-    out = BASE_DIR / "exports" / f"radar_{assessment_id}.png"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out, dpi=180, bbox_inches="tight")
-    plt.close(fig)
-    return out
-
-
-def base_recommendations(assessment_id: int) -> str:
-    r = calc_results(assessment_id)
-    ranked = sorted(r["dims"].items(), key=lambda kv: kv[1])
-    lines = ["ПРІОРИТЕТНІ РЕКОМЕНДАЦІЇ"]
-    for n, (dim, value) in enumerate(ranked[:4], 1):
-        lines.append(f"{n}. {dim} ({value:.1f}%): {DIM_RECOMMENDATIONS[dim]}")
-    low_items = []
-    for item in MATRIX:
-        sc = r["scores"].get(item["code"])
-        if sc is not None and sc <= 2:
-            low_items.append((sc, item))
-    low_items.sort(key=lambda x: (x[0], x[1]["code"]))
-    if low_items:
-        lines.append("\nКритичні/слабкі показники:")
-        for sc, item in low_items[:10]:
-            lines.append(f"• {item['code']} — {sc}/5: {item['criterion']}")
-    return "\n".join(lines)
-
-
-async def ai_recommendations(assessment_id: int, organization: str) -> str:
-    if not OPENAI_API_KEY or not OPENAI_MODEL:
-        return base_recommendations(assessment_id)
-    r = calc_results(assessment_id)
-    low = []
-    for item in MATRIX:
-        sc = r["scores"].get(item["code"])
-        if sc is not None and sc <= 3:
-            low.append({"code": item["code"], "criterion": item["criterion"], "score": sc, "statement": item["statement"]})
-    prompt = f"""
-Ти — аналітичний модуль методики оцінювання AI-зрілості органу публічної влади.
-Орган: {organization}
-AIMI: {r['aimi']:.2f}% ({maturity_level(r['aimi'])})
-D1-D8: {json.dumps(r['dims'], ensure_ascii=False)}
-Слабкі показники: {json.dumps(low, ensure_ascii=False)}
-
-Сформуй українською мовою практичні рекомендації для підвищення AI-зрілості.
-Вимоги:
-- не змінюй і не переобчислюй оцінки;
-- спирайся лише на наведені результати;
-- розділи рекомендації на: першочергові (0–6 міс.), середньострокові (6–18 міс.), стратегічні (18+ міс.);
-- для кожної рекомендації вкажи, які D/коди вона покращує;
-- окремо познач критичні обмеження D2, D7, D8;
-- не стверджуй, що певна внутрішня практика існує, якщо це не випливає з оцінок;
-- обсяг до 700 слів.
-""".strip()
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    payload = {"model": OPENAI_MODEL, "input": prompt}
-    async with httpx.AsyncClient(timeout=90) as client:
-        resp = await client.post("https://api.openai.com/v1/responses", headers=headers, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-    if isinstance(data.get("output_text"), str) and data["output_text"].strip():
-        return data["output_text"].strip()
-    texts = []
-    for out in data.get("output", []):
-        for content in out.get("content", []):
-            if content.get("type") in ("output_text", "text") and content.get("text"):
-                texts.append(content["text"])
-    return "\n".join(texts).strip() or base_recommendations(assessment_id)
-
-
-async def tg(method: str, payload: dict | None = None, files: dict | None = None) -> Any:
-    async with httpx.AsyncClient(timeout=max(POLL_TIMEOUT + 10, 45)) as client:
-        if files:
-            r = await client.post(f"{API}/{method}", data=payload or {}, files=files)
-        else:
-            r = await client.post(f"{API}/{method}", json=payload or {})
-        r.raise_for_status()
-        data = r.json()
-        if not data.get("ok"):
-            raise RuntimeError(data)
-        return data.get("result")
-
-
-async def send(chat_id: int, text: str, keyboard: list[list[dict]] | None = None) -> None:
-    payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
-    if keyboard:
-        payload["reply_markup"] = {"inline_keyboard": keyboard}
-    await tg("sendMessage", payload)
-
-
-async def send_photo(chat_id: int, path: Path, caption: str = "") -> None:
-    with path.open("rb") as f:
-        await tg("sendPhoto", {"chat_id": str(chat_id), "caption": caption}, {"photo": (path.name, f, "image/png")})
-
-
-async def send_document(chat_id: int, path: Path, caption: str = "") -> None:
-    mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-    with path.open("rb") as f:
-        await tg("sendDocument", {"chat_id": str(chat_id), "caption": caption}, {"document": (path.name, f, mime)})
-
-
-def score_keyboard(assessment_id: int, idx: int) -> list[list[dict]]:
-    return [[{"text": str(s), "callback_data": f"score:{assessment_id}:{idx}:{s}"} for s in range(6)]]
-
-
-def validation_keyboard(assessment_id: int) -> list[list[dict]]:
-    return [[{"text": str(s), "callback_data": f"valid:{assessment_id}:{s}"} for s in range(1, 6)]]
-
-
-async def ask_question(chat_id: int, assessment_id: int, idx: int) -> None:
-    item = MATRIX[idx]
-    title = f"{idx+1}/{len(MATRIX)}  {item['code']} — {item['criterion']}\n{item['dimension_name']}"
-    text = f"{title}\n\n{item['statement']}\n\nОцініть 0–5:"
-    await send(chat_id, text, score_keyboard(assessment_id, idx))
-
-
-async def start_assessment(chat_id: int, user: dict) -> None:
-    with db() as c:
-        active = c.execute("SELECT id FROM assessments WHERE chat_id=? AND status IN ('await_org','running') ORDER BY id DESC LIMIT 1", (chat_id,)).fetchone()
-        if active:
-            await send(chat_id, f"У вас уже є незавершене оцінювання №{active['id']}. Надішліть назву органу або продовжуйте відповідати. /cancel — скасувати.")
-            return
-        cur = c.execute(
-            "INSERT INTO assessments(chat_id,user_id,username,status,current_index,created_at) VALUES(?,?,?,?,?,?)",
-            (chat_id, user.get("id"), user.get("username"), "await_org", 0, now_iso()),
-        )
-        aid = cur.lastrowid
-    await send(chat_id, f"Розпочато оцінювання №{aid}.\n\nНадішліть назву органу публічної влади, який оцінюється.")
-
-
-async def finish_assessment(chat_id: int, assessment_id: int) -> None:
-    with db() as c:
-        a = c.execute("SELECT * FROM assessments WHERE id=?", (assessment_id,)).fetchone()
-        c.execute("UPDATE assessments SET status='await_validation', finished_at=? WHERE id=?", (now_iso(), assessment_id))
-    r = calc_results(assessment_id)
-    chart = make_radar(assessment_id, a["organization"] or "Орган")
-    summary = [f"Оцінювання №{assessment_id} завершено.", f"Орган: {a['organization']}", f"AIMI: {r['aimi']:.1f}%", f"Рівень: {maturity_level(r['aimi'])}", ""]
-    summary.extend(f"{d}: {r['dims'][d]:.1f}%" for d, _ in DIMENSIONS)
-    await send_photo(chat_id, chart, "Профіль AI-зрілості")
-    await send(chat_id, "\n".join(summary))
-    await send(chat_id, "Наскільки отриманий профіль відповідає фактичному стану органу?\n1 — зовсім не відповідає; 5 — повністю відповідає.", validation_keyboard(assessment_id))
-
-
-async def show_report(chat_id: int, assessment_id: int) -> None:
-    with db() as c:
-        a = c.execute("SELECT * FROM assessments WHERE id=? AND chat_id=?", (assessment_id, chat_id)).fetchone()
-    if not a:
-        await send(chat_id, "Оцінювання не знайдено.")
-        return
-    r = calc_results(assessment_id)
-    if not r["complete"]:
-        await send(chat_id, f"Оцінювання №{assessment_id} ще не завершено ({len(r['scores'])}/48 відповідей).")
-        return
-    chart = make_radar(assessment_id, a["organization"] or "Орган")
-    text = [f"ЗВІТ №{assessment_id}", f"Орган: {a['organization']}", f"AIMI: {r['aimi']:.1f}% — {maturity_level(r['aimi'])}"]
-    text.extend(f"{d}: {r['dims'][d]:.1f}%" for d, _ in DIMENSIONS)
-    if a["validation_score"]:
-        text.append(f"Відповідність за оцінкою респондента: {a['validation_score']}/5")
-    await send_photo(chat_id, chart, "Профіль AI-зрілості")
-    await send(chat_id, "\n".join(text))
-    rec = a["recommendations"] or base_recommendations(assessment_id)
-    await send(chat_id, rec[:4000])
-
-
-def export_json(assessment_id: int) -> Path:
-    with db() as c:
-        a = dict(c.execute("SELECT * FROM assessments WHERE id=?", (assessment_id,)).fetchone())
-        ans = [dict(x) for x in c.execute("SELECT * FROM answers WHERE assessment_id=? ORDER BY code", (assessment_id,)).fetchall()]
-    r = calc_results(assessment_id)
-    data = {"assessment": a, "results": {k:v for k,v in r.items() if k != "scores"}, "answers": ans}
-    out = BASE_DIR / "exports" / f"assessment_{assessment_id}.json"
-    out.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    return out
-
-
-
-def _assessment_payload(assessment_id: int) -> tuple[dict, list[dict], dict]:
-    with db() as c:
-        row = c.execute("SELECT * FROM assessments WHERE id=?", (assessment_id,)).fetchone()
-        if not row:
-            raise ValueError("Assessment not found")
-        a = dict(row)
-        ans = [dict(x) for x in c.execute("SELECT * FROM answers WHERE assessment_id=? ORDER BY code", (assessment_id,)).fetchall()]
-    r = calc_results(assessment_id)
-    by_code = {x["code"]: x for x in ans}
-    for item in MATRIX:
-        x = by_code.get(item["code"], {})
-        item_score = x.get("score")
-        x["dimension"] = item["dimension"]
-        x["dimension_name"] = item["dimension_name"]
-        x["criterion"] = item["criterion"]
-        x["statement"] = item["statement"]
-        x["score"] = item_score
-        by_code[item["code"]] = x
-    ordered = [by_code[item["code"]] for item in MATRIX]
-    return a, ordered, r
-
-
-def export_xlsx(assessment_id: int) -> Path:
-    a, answers, r = _assessment_payload(assessment_id)
-    out = BASE_DIR / "exports" / f"AI_Maturity_Assessment_{assessment_id}.xlsx"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    wb = xlsxwriter.Workbook(out)
-    ws = wb.add_worksheet("Звіт")
-    detail = wb.add_worksheet("48 показників")
-    scale = wb.add_worksheet("Шкала")
-    fmt_title = wb.add_format({"bold": True, "font_size": 16, "align": "center", "valign": "vcenter"})
-    fmt_h = wb.add_format({"bold": True, "bg_color": "#D9EAF7", "border": 1, "align": "center", "valign": "vcenter", "text_wrap": True})
-    fmt_txt = wb.add_format({"border": 1, "valign": "top", "text_wrap": True})
-    fmt_num = wb.add_format({"border": 1, "align": "center", "num_format": "0.0%"})
-    fmt_pct = wb.add_format({"border": 1, "align": "center", "num_format": "0.0"})
-    fmt_score = wb.add_format({"border": 1, "align": "center"})
-    fmt_kpi = wb.add_format({"bold": True, "font_size": 14, "align": "center", "border": 1, "bg_color": "#EEF5EA"})
-    ws.merge_range("A1:F1", "AI Maturity Assessment — звіт", fmt_title)
-    ws.write("A3", "Орган", fmt_h); ws.merge_range("B3:F3", a.get("organization") or "", fmt_txt)
-    ws.write("A4", "Оцінювання №", fmt_h); ws.write("B4", assessment_id, fmt_txt)
-    ws.write("C4", "Дата завершення", fmt_h); ws.write("D4", a.get("finished_at") or "", fmt_txt)
-    ws.write("E4", "Верифікація", fmt_h); ws.write("F4", f"{a.get('validation_score') or '-'} / 5", fmt_txt)
-    ws.write("A6", "AIMI", fmt_h); ws.write("B6", r["aimi"], fmt_kpi)
-    ws.write("C6", "Рівень", fmt_h); ws.merge_range("D6:F6", maturity_level(r["aimi"]), fmt_kpi)
-    ws.write_row("A8", ["Код", "Вимір", "Dᵢ, %", "Сума балів", "Макс. бал", "Пріоритет"], fmt_h)
-    ranked = {d: i+1 for i,(d,_) in enumerate(sorted(r["dims"].items(), key=lambda kv: kv[1]))}
-    for row,(d,name) in enumerate(DIMENSIONS, 8):
-        ws.write(row,0,d,fmt_txt); ws.write(row,1,name,fmt_txt); ws.write(row,2,r["dims"][d],fmt_pct)
-        ws.write(row,3,r["sums"][d],fmt_score); ws.write(row,4,30,fmt_score); ws.write(row,5,ranked[d],fmt_score)
-    chart = wb.add_chart({"type":"radar", "subtype":"filled"})
-    chart.add_series({"name":"AI-зрілість", "categories":"='Звіт'!$A$9:$A$16", "values":"='Звіт'!$C$9:$C$16"})
-    chart.set_title({"name":"Профіль AI-зрілості"}); chart.set_legend({"none": True}); chart.set_size({"width": 620, "height": 380})
-    ws.insert_chart("H3", chart)
-    rec = a.get("recommendations") or base_recommendations(assessment_id)
-    ws.write("A18", "Рекомендації", fmt_h); ws.merge_range("B18:F18", rec, fmt_txt)
-    if a.get("validation_comment"):
-        ws.write("A20", "Коментар верифікації", fmt_h); ws.merge_range("B20:F20", a["validation_comment"], fmt_txt)
-    ws.set_column("A:A", 18); ws.set_column("B:B", 42); ws.set_column("C:F", 16); ws.set_row(17, 95)
-
-    detail.write_row(0,0,["Код","Вимір","Критерій","Діагностичне твердження","Оцінка 0–5","Рівень","Джерело","Підстава / evidence","Обґрунтування","Confidence"],fmt_h)
-    for i,x in enumerate(answers,1):
-        score = x.get("score")
-        vals=[x.get("code"),x.get("dimension_name"),x.get("criterion"),x.get("statement"),score,SCALE.get(score,""),x.get("source") or "",x.get("evidence") or "",x.get("rationale") or "",x.get("confidence")]
-        for j,v in enumerate(vals): detail.write(i,j,v,fmt_score if j in (4,9) else fmt_txt)
-    detail.freeze_panes(1,0); detail.autofilter(0,0,len(answers),9)
-    detail.set_column(0,0,9); detail.set_column(1,2,28); detail.set_column(3,3,65); detail.set_column(4,5,13); detail.set_column(6,9,24)
-    scale.write_row(0,0,["Бал","Рівень","Зміст"],fmt_h)
-    descr={0:"Практика, спроможність або механізм відсутні",1:"Окремі неформальні дії або ініціативи без системного характеру",2:"Окремі елементи запроваджено лише в частині підрозділів або процесів",3:"Практика формалізована, застосовується регулярно й охоплює основні відповідні процеси",4:"Практика інтегрована в систему управління, забезпечена ресурсами, контролем і взаємодією",5:"Спроможність є невід’ємним компонентом управління, регулярно оцінюється та вдосконалюється"}
-    for i in range(6): scale.write_row(i+1,0,[i,SCALE[i],descr[i]],fmt_txt)
-    scale.set_column(0,0,8); scale.set_column(1,1,24); scale.set_column(2,2,80)
-    wb.close()
-    return out
-
-
-def _register_pdf_fonts() -> tuple[str,str]:
-    regular_candidates=["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/dejavu/DejaVuSans.ttf"]
-    bold_candidates=["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf"]
-    reg=next((x for x in regular_candidates if Path(x).exists()), None)
-    bold=next((x for x in bold_candidates if Path(x).exists()), None)
-    if reg:
-        if "DejaVu" not in pdfmetrics.getRegisteredFontNames(): pdfmetrics.registerFont(TTFont("DejaVu",reg))
-        if bold and "DejaVuBold" not in pdfmetrics.getRegisteredFontNames(): pdfmetrics.registerFont(TTFont("DejaVuBold",bold))
-        return "DejaVu", "DejaVuBold" if bold else "DejaVu"
-    return "Helvetica", "Helvetica-Bold"
-
-
-def export_pdf(assessment_id: int) -> Path:
-    a, answers, r = _assessment_payload(assessment_id)
-    out = BASE_DIR / "exports" / f"AI_Maturity_Assessment_{assessment_id}.pdf"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    font,bold = _register_pdf_fonts()
-    styles=getSampleStyleSheet()
-    styles.add(ParagraphStyle(name="UABody", parent=styles["BodyText"], fontName=font, fontSize=9, leading=12, spaceAfter=4))
-    styles.add(ParagraphStyle(name="UAHead", parent=styles["Heading2"], fontName=bold, fontSize=13, leading=16, spaceBefore=8, spaceAfter=7))
-    styles.add(ParagraphStyle(name="UATitle", parent=styles["Title"], fontName=bold, fontSize=17, leading=21, alignment=TA_CENTER, spaceAfter=12))
-    styles.add(ParagraphStyle(name="UASmall", parent=styles["BodyText"], fontName=font, fontSize=7.5, leading=9.5))
-    doc=SimpleDocTemplate(str(out), pagesize=A4, rightMargin=14*mm,leftMargin=14*mm,topMargin=14*mm,bottomMargin=14*mm, title=f"AI Maturity Assessment #{assessment_id}")
-    story=[]
-    story += [Paragraph("AI Maturity Assessment", styles["UATitle"]), Paragraph(f"Звіт за результатами оцінювання AI-зрілості органу публічної влади", styles["UAHead"])]
-    meta=[["Орган", a.get("organization") or ""],["Оцінювання", f"№ {assessment_id}"],["Дата завершення", a.get("finished_at") or ""],["AIMI", f"{r['aimi']:.1f}%"],["Рівень", maturity_level(r["aimi"])],["Відповідність результату", f"{a.get('validation_score') or '-'} / 5"]]
-    t=Table([[Paragraph(str(c),styles["UABody"]) for c in row] for row in meta], colWidths=[45*mm,125*mm])
-    t.setStyle(TableStyle([("GRID",(0,0),(-1,-1),0.4,colors.grey),("BACKGROUND",(0,0),(0,-1),colors.HexColor("#E8EEF5")),("FONTNAME",(0,0),(-1,-1),font),("FONTNAME",(0,0),(0,-1),bold),("VALIGN",(0,0),(-1,-1),"TOP"),("LEFTPADDING",(0,0),(-1,-1),5),("RIGHTPADDING",(0,0),(-1,-1),5)]))
-    story += [t, Spacer(1,7*mm)]
-    chart=make_radar(assessment_id,a.get("organization") or "Орган")
-    story += [Image(str(chart), width=140*mm, height=140*mm), Spacer(1,4*mm), Paragraph("Профіль AI-зрілості за вісьмома вимірами", styles["UABody"])]
-    story += [Paragraph("Результати за вимірами", styles["UAHead"])]
-    data=[["Код","Вимір","Dᵢ, %","Сума","Макс."]]
-    for d,name in DIMENSIONS: data.append([d,name,f"{r['dims'][d]:.1f}",str(r['sums'][d]),"30"])
-    t=Table([[Paragraph(str(c),styles["UASmall"]) for c in row] for row in data], colWidths=[13*mm,100*mm,19*mm,19*mm,19*mm], repeatRows=1)
-    t.setStyle(TableStyle([("GRID",(0,0),(-1,-1),0.35,colors.grey),("BACKGROUND",(0,0),(-1,0),colors.HexColor("#D9EAF7")),("FONTNAME",(0,0),(-1,0),bold),("ALIGN",(2,1),(-1,-1),"CENTER"),("VALIGN",(0,0),(-1,-1),"TOP")]))
-    story += [t, PageBreak(), Paragraph("Деталізація 48 діагностичних показників", styles["UAHead"])]
-    ddata=[["Код","Критерій","Твердження","Бал"]]
-    for x in answers: ddata.append([x["code"],x["criterion"],x["statement"],str(x.get("score") if x.get("score") is not None else "-")])
-    t=Table([[Paragraph(str(c),styles["UASmall"]) for c in row] for row in ddata], colWidths=[14*mm,42*mm,105*mm,12*mm], repeatRows=1)
-    t.setStyle(TableStyle([("GRID",(0,0),(-1,-1),0.25,colors.HexColor("#999999")),("BACKGROUND",(0,0),(-1,0),colors.HexColor("#D9EAF7")),("FONTNAME",(0,0),(-1,0),bold),("VALIGN",(0,0),(-1,-1),"TOP"),("ALIGN",(-1,1),(-1,-1),"CENTER")]))
-    story += [t, PageBreak(), Paragraph("Рекомендації для підвищення AI-зрілості", styles["UAHead"])]
-    rec=a.get("recommendations") or base_recommendations(assessment_id)
-    for para in rec.split("\n"):
-        if para.strip(): story.append(Paragraph(para.replace("&","&amp;"), styles["UABody"]))
-    if a.get("validation_comment"):
-        story += [Spacer(1,5*mm), Paragraph("Верифікація результату", styles["UAHead"]), Paragraph(f"Оцінка відповідності: {a.get('validation_score')}/5", styles["UABody"]), Paragraph(a["validation_comment"].replace("&","&amp;"), styles["UABody"])]
-    story += [Spacer(1,6*mm), Paragraph("Примітка: інтегральний AIMI не повинен компенсувати критично низькі значення D2, D7 і D8 для сценаріїв із істотним впливом на права, свободи, обов’язки або юридично значущі рішення.", styles["UASmall"])]
-    doc.build(story)
-    return out
-
-
-def export_bundle(assessment_id: int) -> Path:
-    pdf=export_pdf(assessment_id); xlsx=export_xlsx(assessment_id); js=export_json(assessment_id)
-    a,_,_= _assessment_payload(assessment_id)
-    radar=make_radar(assessment_id,a.get("organization") or "Орган")
-    out=BASE_DIR/"exports"/f"AI_Maturity_Assessment_{assessment_id}_bundle.zip"
-    with zipfile.ZipFile(out,"w",zipfile.ZIP_DEFLATED) as z:
-        for p in (pdf,xlsx,js,radar): z.write(p,arcname=p.name)
-    return out
-
-
-async def upload_to_google_drive(paths: list[Path]) -> list[dict]:
-    """Upload files through the configured Google Apps Script web app.
-
-    The Apps Script receives JSON with a shared secret, filename, MIME type and
-    base64 payload, then writes the file into the configured Drive folder.
-    """
-    if not GDRIVE_UPLOAD_URL or not GDRIVE_UPLOAD_SECRET:
-        raise RuntimeError("Google Drive шлюз не налаштовано: потрібні GDRIVE_UPLOAD_URL і GDRIVE_UPLOAD_SECRET")
-
-    uploaded: list[dict] = []
-    async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
-        for p in paths:
-            mime = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
-            payload = {
-                "secret": GDRIVE_UPLOAD_SECRET,
-                "filename": p.name,
-                "mime_type": mime,
-                "file_base64": base64.b64encode(p.read_bytes()).decode("ascii"),
-            }
-            resp = await client.post(GDRIVE_UPLOAD_URL, json=payload)
-            resp.raise_for_status()
+async def crawl_official_site(url,max_pages=12,max_chars=70000):
+    if not re.match(r'^https?://',url,re.I): url='https://'+url
+    host=urlparse(url).netloc.lower().removeprefix('www.'); seen=set(); queue=[url]; docs=[]
+    headers={'User-Agent':'Mozilla/5.0 AI-Maturity-Research-Bot/0.3'}
+    async with httpx.AsyncClient(timeout=20,follow_redirects=True,headers=headers) as c:
+        while queue and len(seen)<max_pages and sum(len(x) for x in docs)<max_chars:
+            u=queue.pop(0)
+            if u in seen: continue
+            seen.add(u)
             try:
-                data = resp.json()
-            except Exception as exc:
-                raise RuntimeError(f"Apps Script повернув не JSON: {resp.text[:300]}") from exc
-            if not data.get("ok"):
-                raise RuntimeError(data.get("error") or f"Помилка Google Drive для {p.name}")
-            uploaded.append({
-                "id": data.get("file_id", ""),
-                "name": data.get("filename") or p.name,
-                "webViewLink": data.get("url", ""),
-            })
+                r=await c.get(u); ct=r.headers.get('content-type','')
+                if r.status_code!=200 or 'text/html' not in ct: continue
+                s=BeautifulSoup(r.text,'html.parser')
+                for z in s(['script','style','noscript','svg']): z.decompose()
+                text=' '.join(s.stripped_strings); docs.append(f'URL: {u}\n{text[:12000]}')
+                for a in s.find_all('a',href=True):
+                    v=urljoin(str(r.url),a['href']); p=urlparse(v)
+                    if p.scheme in ('http','https') and p.netloc.lower().removeprefix('www.')==host and v not in seen:
+                        label=(a.get_text(' ',strip=True)+' '+v).lower()
+                        if any(k in label for k in ['цифр','digital','штуч','artificial','ai','дан','data','стратег','нормат','безпек','структур','положен','відкрит','реєстр','api']): queue.append(v.split('#')[0])
+            except Exception: pass
+    return '\n\n'.join(docs)[:max_chars],len(seen)
+
+async def ai_assess(aid,organization,url):
+    if not OPENAI_API_KEY or not OPENAI_MODEL: raise RuntimeError('Для ШІ-режиму потрібно задати OPENAI_API_KEY та OPENAI_MODEL у Render.')
+    corpus,pages=await crawl_official_site(url)
+    if not corpus.strip(): raise RuntimeError('Не вдалося отримати текст з офіційного вебсайту.')
+    criteria=[{'code':x['code'],'criterion':x['criterion'],'statement':x['statement']} for x in MATRIX]
+    prompt=f'''Ти — дослідницький модуль оцінювання AI-зрілості органу публічної влади.\nОрган: {organization}\nОфіційний сайт: {url}\nОціни кожен критерій 0–5 ТІЛЬКИ якщо наведений корпус офіційного сайту містить достатній прямий доказ. Якщо доказів недостатньо — score=null. Не домислюй внутрішні практики. Поверни ТІЛЬКИ JSON-об'єкт виду {{"items":[{{"code":"D1.1","score":0..5|null,"evidence":"коротка фактична підстава + URL","rationale":"коротке обґрунтування","confidence":0..1}}]}}.\nКритерії: {json.dumps(criteria,ensure_ascii=False)}\n\nКОРПУС ОФІЦІЙНОГО САЙТУ:\n{corpus}'''
+    headers={'Authorization':f'Bearer {OPENAI_API_KEY}','Content-Type':'application/json'}; payload={'model':OPENAI_MODEL,'input':prompt}
+    async with httpx.AsyncClient(timeout=180) as c: resp=await c.post('https://api.openai.com/v1/responses',headers=headers,json=payload); resp.raise_for_status(); data=resp.json()
+    text=data.get('output_text','')
+    if not text:
+        text=''.join(z.get('text','') for o in data.get('output',[]) for z in o.get('content',[]) if z.get('text'))
+    m=re.search(r'\{.*\}',text,re.S)
+    if not m: raise RuntimeError('ШІ не повернув структурований результат.')
+    obj=json.loads(m.group(0)); allowed={x['code'] for x in MATRIX}; saved=0
+    with db() as c:
+        for x in obj.get('items',[]):
+            if x.get('code') not in allowed or not isinstance(x.get('score'),int) or x['score'] not in range(6): continue
+            c.execute('INSERT OR REPLACE INTO answers(assessment_id,code,score,source,evidence,rationale,confidence,created_at) VALUES(?,?,?,?,?,?,?,?)',(aid,x['code'],x['score'],'ai',str(x.get('evidence',''))[:2000],str(x.get('rationale',''))[:1000],x.get('confidence'),now_iso())); saved+=1
+        c.execute('UPDATE assessments SET coverage=?,ai_note=? WHERE id=?',(saved/len(MATRIX)*100,f'Проаналізовано сторінок: {pages}',aid))
+    return saved,pages
+
+async def run_ai_stage(chat,aid):
+    with db() as c: a=c.execute('SELECT * FROM assessments WHERE id=?',(aid,)).fetchone()
+    await send(chat,'Виконую ШІ-аналіз офіційного вебсайту. Це може тривати кілька хвилин…')
+    try: saved,pages=await ai_assess(aid,a['organization'],a['official_url'])
+    except Exception as e:
+        with db() as c: c.execute("UPDATE assessments SET status='await_url' WHERE id=?",(aid,))
+        await send(chat,f'ШІ-аналіз не виконано: {type(e).__name__}: {e}'); return
+    miss=missing_indices(aid); mode=a['mode']
+    await send(chat,f'Автоматичний етап завершено. Визначено {saved} із 48 показників. Не визначено: {len(miss)}.')
+    if mode=='hybrid' and miss:
+        with db() as c: c.execute("UPDATE assessments SET status='running',current_index=? WHERE id=?",(miss[0],aid))
+        await send(chat,'Переходимо до підкріплення: необхідно уточнити лише показники, які ШІ не зміг визначити.')
+        await ask_question(chat,aid,miss[0])
+    else: await finish_assessment(chat,aid)
+
+def make_radar(aid,org):
+    r=calc_results(aid); labels=[d[0] for d in DIMENSIONS]; values=[r['dims'][d] or 0 for d in labels]; vals=values+values[:1]; ang=np.linspace(0,2*np.pi,len(labels),endpoint=False).tolist()+[0]
+    fig=plt.figure(figsize=(8,8)); ax=plt.subplot(111,polar=True); ax.plot(ang,vals,linewidth=2); ax.fill(ang,vals,alpha=.15); ax.set_thetagrids(np.degrees(ang[:-1]),labels); ax.set_ylim(0,100); ax.set_yticks([20,40,60,80,100]); ax.set_title(f'Профіль AI-зрілості\n{org}\nAIMI = {r["aimi"]:.1f}% | покриття {r["coverage"]:.1f}%',pad=25)
+    out=BASE_DIR/'exports'/f'radar_{aid}.png'; out.parent.mkdir(parents=True,exist_ok=True); fig.savefig(out,dpi=180,bbox_inches='tight'); plt.close(fig); return out
+
+async def finish_assessment(chat,aid):
+    with db() as c: a=c.execute('SELECT * FROM assessments WHERE id=?',(aid,)).fetchone(); c.execute("UPDATE assessments SET status='await_validation',finished_at=?,coverage=? WHERE id=?",(now_iso(),calc_results(aid)['coverage'],aid))
+    r=calc_results(aid); chart=make_radar(aid,a['organization'] or 'Орган'); await send_photo(chat,chart,'Профіль AI-зрілості')
+    dims='\n'.join(f"{d}: {r['dims'][d]:.1f}%" if r['dims'][d] is not None else f'{d}: не визначено' for d,_ in DIMENSIONS)
+    await send(chat,f"Оцінювання №{aid} завершено.\nОрган: {a['organization']}\nРежим: {MODE_LABEL.get(a['mode'],a['mode'])}\nAIMI: {r['aimi']:.1f}%\nПовнота: {r['coverage']:.1f}% ({len(r['scores'])}/48)\nРівень: {maturity_level(r['aimi'])}\n\n{dims}")
+    await send(chat,'Наскільки отриманий профіль відповідає фактичному стану органу?\n1 — зовсім не відповідає; 5 — повністю відповідає.',validation_keyboard(aid))
+
+def base_recommendations(aid):
+    r=calc_results(aid); ranked=sorted([(d,v) for d,v in r['dims'].items() if v is not None],key=lambda x:x[1]); return 'ПРІОРИТЕТНІ НАПРЯМИ\n'+'\n'.join(f'{i}. {d}: {v:.1f}% — потребує пріоритетного опрацювання.' for i,(d,v) in enumerate(ranked[:4],1))
+
+def _payload(aid):
+    with db() as c: a=dict(c.execute('SELECT * FROM assessments WHERE id=?',(aid,)).fetchone()); rows=[dict(x) for x in c.execute('SELECT * FROM answers WHERE assessment_id=?',(aid,)).fetchall()]
+    by={x['code']:x for x in rows}; ans=[]
+    for m in MATRIX:
+        x=by.get(m['code'],{}); ans.append({**m,**x,'score':x.get('score'),'source':x.get('source','ND')})
+    return a,ans,calc_results(aid)
+
+def _fonts():
+    reg='/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'; bold='/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'
+    if Path(reg).exists():
+        if 'DejaVu' not in pdfmetrics.getRegisteredFontNames(): pdfmetrics.registerFont(TTFont('DejaVu',reg)); pdfmetrics.registerFont(TTFont('DejaVuBold',bold))
+        return 'DejaVu','DejaVuBold'
+    return 'Helvetica','Helvetica-Bold'
+
+def export_pdf(aid):
+    a,ans,r=_payload(aid); out=BASE_DIR/'exports'/f'AI_Maturity_Assessment_{aid}.pdf'; out.parent.mkdir(parents=True,exist_ok=True); font,bold=_fonts(); st=getSampleStyleSheet(); st.add(ParagraphStyle(name='U',parent=st['BodyText'],fontName=font,fontSize=8.5,leading=11)); st.add(ParagraphStyle(name='H',parent=st['Heading2'],fontName=bold,fontSize=13)); st.add(ParagraphStyle(name='T',parent=st['Title'],fontName=bold,fontSize=17,alignment=TA_CENTER))
+    doc=SimpleDocTemplate(str(out),pagesize=A4,rightMargin=12*mm,leftMargin=12*mm,topMargin=12*mm,bottomMargin=12*mm); story=[Paragraph('AI Maturity Assessment',st['T']),Paragraph('Звіт за результатами оцінювання AI-зрілості органу публічної влади',st['H'])]
+    meta=[['Орган',a.get('organization') or ''],['Офіційний сайт',a.get('official_url') or '—'],['Режим оцінювання',MODE_LABEL.get(a.get('mode'),a.get('mode') or '—')],['AIMI',f"{r['aimi']:.1f}%"],['Повнота оцінювання',f"{r['coverage']:.1f}% ({len(r['scores'])}/48)"],['Рівень',maturity_level(r['aimi'])]]
+    t=Table([[Paragraph(str(v),st['U']) for v in row] for row in meta],colWidths=[45*mm,135*mm]); t.setStyle(TableStyle([('GRID',(0,0),(-1,-1),.4,colors.grey),('FONTNAME',(0,0),(-1,-1),font),('FONTNAME',(0,0),(0,-1),bold),('VALIGN',(0,0),(-1,-1),'TOP')])); story += [t,Spacer(1,5*mm)]
+    if a.get('mode')=='ai': story.append(Paragraph('Примітка: це ШІ-аналіз на основі інформації, доступної на офіційному вебсайті органу. Показники без достатніх доказів позначено «не визначено».',st['U']))
+    elif a.get('mode')=='hybrid': story.append(Paragraph('Примітка: це ШІ-аналіз з підкріпленням. Первинне оцінювання виконано ШІ за офіційним вебсайтом; невизначені показники уточнено респондентом.',st['U']))
+    story += [Image(str(make_radar(aid,a.get('organization') or 'Орган')),width=135*mm,height=135*mm),PageBreak(),Paragraph('Деталізація 48 показників',st['H'])]
+    data=[['Код','Критерій','Бал','Джерело']]+[[x['code'],x['criterion'],str(x['score']) if x['score'] is not None else 'Не визначено',{'ai':'ШІ','respondent':'Респондент','ND':'Не визначено'}.get(x['source'],x['source'])] for x in ans]
+    t=Table([[Paragraph(str(v),st['U']) for v in row] for row in data],colWidths=[16*mm,112*mm,25*mm,27*mm],repeatRows=1); t.setStyle(TableStyle([('GRID',(0,0),(-1,-1),.3,colors.grey),('FONTNAME',(0,0),(-1,0),bold),('VALIGN',(0,0),(-1,-1),'TOP')])); story += [t,PageBreak(),Paragraph('Рекомендації',st['H']),Paragraph((a.get('recommendations') or base_recommendations(aid)).replace('\n','<br/>'),st['U'])]; doc.build(story); return out
+
+def export_json(aid):
+    a,ans,r=_payload(aid); out=BASE_DIR/'exports'/f'assessment_{aid}.json'; out.write_text(json.dumps({'assessment':a,'results':{k:v for k,v in r.items() if k!='scores'},'answers':ans},ensure_ascii=False,indent=2),encoding='utf-8'); return out
+
+def export_xlsx(aid):
+    a,ans,r=_payload(aid); out=BASE_DIR/'exports'/f'AI_Maturity_Assessment_{aid}.xlsx'; wb=xlsxwriter.Workbook(out); ws=wb.add_worksheet('Звіт'); de=wb.add_worksheet('48 показників'); h=wb.add_format({'bold':True,'border':1,'text_wrap':True}); tx=wb.add_format({'border':1,'text_wrap':True,'valign':'top'}); ws.write_row(0,0,['Орган','Режим','URL','AIMI %','Повнота %','Рівень'],h); ws.write_row(1,0,[a.get('organization'),MODE_LABEL.get(a.get('mode')),a.get('official_url'),r['aimi'],r['coverage'],maturity_level(r['aimi'])],tx); de.write_row(0,0,['Код','Вимір','Критерій','Твердження','Оцінка','Джерело','Evidence','Обґрунтування','Confidence'],h)
+    for i,x in enumerate(ans,1): de.write_row(i,0,[x.get('code'),x.get('dimension_name'),x.get('criterion'),x.get('statement'),x.get('score'),x.get('source'),x.get('evidence'),x.get('rationale'),x.get('confidence')],tx)
+    de.set_column(0,0,10); de.set_column(1,2,28); de.set_column(3,3,65); de.set_column(4,8,20); wb.close(); return out
+
+def export_bundle(aid):
+    files=[export_pdf(aid),export_xlsx(aid),export_json(aid)]; a,_,_=_payload(aid); files.append(make_radar(aid,a.get('organization') or 'Орган')); out=BASE_DIR/'exports'/f'AI_Maturity_Assessment_{aid}_bundle.zip';
+    with zipfile.ZipFile(out,'w',zipfile.ZIP_DEFLATED) as z:
+        for p in files: z.write(p,arcname=p.name)
+    return out
+
+async def upload_to_google_drive(paths):
+    if not GDRIVE_UPLOAD_URL or not GDRIVE_UPLOAD_SECRET: raise RuntimeError('Google Drive не налаштовано')
+    uploaded=[]
+    async with httpx.AsyncClient(timeout=120,follow_redirects=True) as c:
+        for p in paths:
+            payload={'secret':GDRIVE_UPLOAD_SECRET,'filename':p.name,'mime_type':mimetypes.guess_type(p.name)[0] or 'application/octet-stream','file_base64':base64.b64encode(p.read_bytes()).decode('ascii')}; r=await c.post(GDRIVE_UPLOAD_URL,json=payload); r.raise_for_status(); j=r.json();
+            if not j.get('ok'): raise RuntimeError(j.get('error','Drive error'))
+            uploaded.append(j)
     return uploaded
 
+async def finalize_and_archive(aid,chat):
+    pdf=export_pdf(aid); await send_document(chat,pdf,'Фінальний PDF-звіт AI-зрілості')
+    if GDRIVE_UPLOAD_URL and GDRIVE_UPLOAD_SECRET:
+        try: await upload_to_google_drive([pdf]); await send(chat,'Фінальний PDF-звіт сформовано. Копію результату збережено в журналі.')
+        except Exception as e: print('Drive auto-upload error:',repr(e),flush=True); await send(chat,'Фінальний PDF-звіт сформовано, але копію не вдалося зберегти в журналі.')
+    else: await send(chat,'Фінальний PDF-звіт сформовано.')
 
-async def finalize_and_archive(assessment_id: int, chat_id: int) -> None:
-    """Create the final PDF, send it to Telegram and archive a copy to Drive."""
-    with db() as c:
-        a = c.execute("SELECT * FROM assessments WHERE id=?", (assessment_id,)).fetchone()
-    if not a:
-        return
-
-    # Ensure the PDF always contains at least deterministic base recommendations.
-    if not a["recommendations"]:
-        rec = base_recommendations(assessment_id)
-        with db() as c:
-            c.execute("UPDATE assessments SET recommendations=? WHERE id=?", (rec, assessment_id))
-
-    pdf = export_pdf(assessment_id)
-    await send_document(chat_id, pdf, "Фінальний PDF-звіт AI-зрілості")
-
-    if not GDRIVE_UPLOAD_URL or not GDRIVE_UPLOAD_SECRET:
-        await send(chat_id, "PDF сформовано. Google Drive-архів не налаштовано.")
-        return
-
-    try:
-        uploaded = await upload_to_google_drive([pdf])
-        link = uploaded[0].get("webViewLink", "") if uploaded else ""
-        msg = "Копію фінального PDF автоматично збережено в Google Drive."
-        if link:
-            msg += f"\n{link}"
-        await send(chat_id, msg)
-    except Exception as exc:
-        print("Drive auto-upload error:", repr(exc), flush=True)
-        await send(chat_id, f"PDF сформовано, але автоматичне архівування в Google Drive не вдалося: {type(exc).__name__}.")
-
-async def handle_message(msg: dict) -> None:
-    chat_id = msg["chat"]["id"]
-    user = msg.get("from", {})
-    text = (msg.get("text") or "").strip()
-    if not text:
-        return
-    if text in ("/start", "/help"):
-        await send(chat_id,
-            "AI Maturity Bot — прототип оцінювання готовності органу публічної влади.\n\n"
-            "/new — нове оцінювання (48 показників)\n"
-            "/status — стан поточного оцінювання\n"
-            "/log — останні оцінювання\n"
-            "/report [ID] — короткий звіт\n"
-            "/pdf [ID] — PDF-звіт\n"
-            "/xlsx [ID] — Excel-звіт\n"
-            "/bundle [ID] — пакет PDF+XLSX+JSON+Radar\n"
-            "/drive [ID] — архівувати пакет у Google Drive\n"
-            "/recommend [ID] — сформувати рекомендації\n"
-            "/export [ID] — вивантажити audit log JSON\n"
-            "/cancel — скасувати поточне оцінювання")
-        return
-    if text == "/new":
-        await start_assessment(chat_id, user); return
-    if text == "/cancel":
-        with db() as c:
-            row = c.execute("SELECT id FROM assessments WHERE chat_id=? AND status IN ('await_org','running') ORDER BY id DESC LIMIT 1", (chat_id,)).fetchone()
-            if row: c.execute("UPDATE assessments SET status='cancelled' WHERE id=?", (row["id"],))
-        await send(chat_id, "Поточне оцінювання скасовано." if row else "Немає активного оцінювання.")
-        return
-    if text == "/status":
-        with db() as c:
-            a = c.execute("SELECT * FROM assessments WHERE chat_id=? ORDER BY id DESC LIMIT 1", (chat_id,)).fetchone()
-        if not a:
-            await send(chat_id, "Оцінювань ще немає. /new")
-        else:
-            r = calc_results(a["id"])
-            await send(chat_id, f"№{a['id']} | {a['organization'] or 'орган не задано'} | статус: {a['status']} | відповідей: {len(r['scores'])}/48")
-        return
-    if text == "/log":
-        with db() as c:
-            rows = c.execute("SELECT * FROM assessments WHERE chat_id=? ORDER BY id DESC LIMIT 10", (chat_id,)).fetchall()
-        if not rows:
-            await send(chat_id, "Журнал порожній.")
-        else:
-            lines=["Останні оцінювання:"]
-            for a in rows:
-                r=calc_results(a["id"])
-                val=f" | AIMI {r['aimi']:.1f}%" if r["complete"] else ""
-                lines.append(f"№{a['id']} — {a['organization'] or 'без назви'} — {a['status']}{val}")
-            await send(chat_id, "\n".join(lines))
-        return
-    if text.startswith("/report"):
+async def handle_message(msg):
+    chat=msg['chat']['id']; user=msg.get('from',{}); text=(msg.get('text') or '').strip()
+    if not text:return
+    if text in ('/start','/help'):
+        await send(chat,'AI Maturity Bot — v0.3\n\n/new — нове оцінювання\n/status — стан\n/log — журнал\n/report [ID] — короткий звіт\n/pdf [ID] — PDF\n/xlsx [ID] — Excel\n/bundle [ID] — пакет\n/drive [ID] — архівувати пакет\n/export [ID] — JSON audit log\n/cancel — скасувати'); return
+    if text=='/new': await start_assessment(chat,user); return
+    if text=='/cancel':
+        with db() as c: a=c.execute("SELECT id FROM assessments WHERE chat_id=? AND status NOT IN ('finished','cancelled') ORDER BY id DESC LIMIT 1",(chat,)).fetchone();
+        if a:
+            with db() as c: c.execute("UPDATE assessments SET status='cancelled' WHERE id=?",(a['id'],))
+        await send(chat,'Поточне оцінювання скасовано.' if a else 'Немає активного оцінювання.'); return
+    if text=='/status':
+        with db() as c:a=c.execute('SELECT * FROM assessments WHERE chat_id=? ORDER BY id DESC LIMIT 1',(chat,)).fetchone()
+        if not a: await send(chat,'Оцінювань ще немає. /new'); return
+        r=calc_results(a['id']); await send(chat,f"№{a['id']} | {a['organization'] or 'орган не задано'} | {MODE_LABEL.get(a['mode'],a['mode'] or 'режим не обрано')} | статус: {a['status']} | визначено: {len(r['scores'])}/48"); return
+    if text.startswith('/report'):
         parts=text.split()
-        if len(parts)>1 and parts[1].isdigit(): aid=int(parts[1])
-        else:
-            with db() as c: row=c.execute("SELECT id FROM assessments WHERE chat_id=? ORDER BY id DESC LIMIT 1",(chat_id,)).fetchone()
-            if not row: await send(chat_id,"Немає оцінювань."); return
-            aid=row["id"]
-        await show_report(chat_id, aid); return
-    if text.startswith(("/pdf", "/xlsx", "/bundle", "/drive")):
-        cmd=text.split()[0]
-        parts=text.split()
-        if len(parts)>1 and parts[1].isdigit(): aid=int(parts[1])
-        else:
-            with db() as c: row=c.execute("SELECT id FROM assessments WHERE chat_id=? ORDER BY id DESC LIMIT 1",(chat_id,)).fetchone()
-            if not row: await send(chat_id,"Немає оцінювань."); return
-            aid=row["id"]
-        with db() as c: a=c.execute("SELECT * FROM assessments WHERE id=? AND chat_id=?",(aid,chat_id)).fetchone()
-        if not a: await send(chat_id,"Оцінювання не знайдено."); return
-        r=calc_results(aid)
-        if not r["complete"]: await send(chat_id,"Спочатку завершіть 48 оцінок."); return
-        await send(chat_id,"Формую файл звіту…")
+        with db() as c: row=c.execute('SELECT id FROM assessments WHERE chat_id=? ORDER BY id DESC LIMIT 1',(chat,)).fetchone()
+        aid=int(parts[1]) if len(parts)>1 and parts[1].isdigit() else (row['id'] if row else None)
+        if not aid: await send(chat,'Немає оцінювань.'); return
+        with db() as c: a=c.execute('SELECT * FROM assessments WHERE id=? AND chat_id=?',(aid,chat)).fetchone()
+        if not a: await send(chat,'Оцінювання не знайдено.'); return
+        r=calc_results(aid); dims='\n'.join(f"{d}: {r['dims'][d]:.1f}%" if r['dims'][d] is not None else f'{d}: не визначено' for d,_ in DIMENSIONS)
+        await send(chat,f"ЗВІТ №{aid}\nОрган: {a['organization'] or '—'}\nРежим: {MODE_LABEL.get(a['mode'],a['mode'] or '—')}\nAIMI: {r['aimi']:.1f}%\nПовнота: {r['coverage']:.1f}% ({len(r['scores'])}/48)\nРівень: {maturity_level(r['aimi'])}\n\n{dims}")
+        return
+    if text=='/log':
+        with db() as c: rows=c.execute('SELECT * FROM assessments WHERE chat_id=? ORDER BY id DESC LIMIT 10',(chat,)).fetchall()
+        await send(chat,'Журнал порожній.' if not rows else 'Останні оцінювання:\n'+'\n'.join(f"№{a['id']} — {a['organization'] or 'без назви'} — {MODE_LABEL.get(a['mode'],a['mode'] or '—')} — {a['status']}" for a in rows)); return
+    if text.startswith(('/pdf','/xlsx','/bundle','/drive','/export')):
+        cmd=text.split()[0]; parts=text.split();
+        with db() as c: row=c.execute('SELECT id FROM assessments WHERE chat_id=? ORDER BY id DESC LIMIT 1',(chat,)).fetchone()
+        aid=int(parts[1]) if len(parts)>1 and parts[1].isdigit() else (row['id'] if row else None)
+        if not aid: await send(chat,'Немає оцінювань.'); return
         try:
-            if cmd=="/pdf": out=export_pdf(aid); await send_document(chat_id,out,"Повний PDF-звіт AI-зрілості")
-            elif cmd=="/xlsx": out=export_xlsx(aid); await send_document(chat_id,out,"Excel-звіт AI-зрілості")
-            elif cmd=="/bundle": out=export_bundle(aid); await send_document(chat_id,out,"Повний пакет оцінювання")
+            if cmd=='/pdf': await send_document(chat,export_pdf(aid),'PDF-звіт')
+            elif cmd=='/xlsx': await send_document(chat,export_xlsx(aid),'Excel-звіт')
+            elif cmd=='/bundle': await send_document(chat,export_bundle(aid),'Повний пакет оцінювання')
+            elif cmd=='/export': await send_document(chat,export_json(aid),'Audit log оцінювання')
             else:
-                pdf=export_pdf(aid); xlsx=export_xlsx(aid); js=export_json(aid); radar=make_radar(aid,a["organization"] or "Орган")
-                uploaded=await upload_to_google_drive([pdf,xlsx,js,radar])
-                lines=["Звіт архівовано в Google Drive:"]+[f"• {x.get('name')} — {x.get('webViewLink','') or x.get('id')}" for x in uploaded]
-                await send(chat_id,"\n".join(lines))
-        except Exception as e:
-            await send(chat_id,f"Не вдалося сформувати/завантажити звіт: {type(e).__name__}: {e}")
+                a,_,_=_payload(aid); paths=[export_pdf(aid),export_xlsx(aid),export_json(aid),make_radar(aid,a.get('organization') or 'Орган')]; await upload_to_google_drive(paths); await send(chat,'Пакет звіту збережено в журналі.')
+        except Exception as e: await send(chat,f'Не вдалося виконати операцію: {type(e).__name__}: {e}')
         return
-
-    if text.startswith("/export"):
-        parts=text.split()
-        if len(parts)>1 and parts[1].isdigit(): aid=int(parts[1])
-        else:
-            with db() as c: row=c.execute("SELECT id FROM assessments WHERE chat_id=? ORDER BY id DESC LIMIT 1",(chat_id,)).fetchone()
-            if not row: await send(chat_id,"Немає оцінювань."); return
-            aid=row["id"]
-        with db() as c: own=c.execute("SELECT 1 FROM assessments WHERE id=? AND chat_id=?",(aid,chat_id)).fetchone()
-        if not own: await send(chat_id,"Оцінювання не знайдено."); return
-        out=export_json(aid)
-        await send_document(chat_id,out,"Audit log оцінювання"); return
-    if text.startswith("/recommend"):
-        parts=text.split()
-        if len(parts)>1 and parts[1].isdigit(): aid=int(parts[1])
-        else:
-            with db() as c: row=c.execute("SELECT id,organization FROM assessments WHERE chat_id=? ORDER BY id DESC LIMIT 1",(chat_id,)).fetchone()
-            if not row: await send(chat_id,"Немає оцінювань."); return
-            aid=row["id"]
-        with db() as c: a=c.execute("SELECT * FROM assessments WHERE id=? AND chat_id=?",(aid,chat_id)).fetchone()
-        if not a: await send(chat_id,"Оцінювання не знайдено."); return
-        r=calc_results(aid)
-        if not r["complete"]: await send(chat_id,"Спочатку завершіть 48 оцінок."); return
-        await send(chat_id,"Формую рекомендації…")
-        try:
-            rec=await ai_recommendations(aid,a["organization"] or "Орган")
-        except Exception as e:
-            rec=base_recommendations(aid)+f"\n\nAI-модуль недоступний: {type(e).__name__}."
-        with db() as c: c.execute("UPDATE assessments SET recommendations=? WHERE id=?",(rec,aid))
-        for chunk in textwrap.wrap(rec, 3900, replace_whitespace=False, drop_whitespace=False):
-            await send(chat_id,chunk)
-        return
-
-    # назва органу для щойно створеного оцінювання
-    with db() as c:
-        a = c.execute("SELECT * FROM assessments WHERE chat_id=? AND status='await_org' ORDER BY id DESC LIMIT 1", (chat_id,)).fetchone()
-        if a:
-            c.execute("UPDATE assessments SET organization=?, status='running' WHERE id=?", (text[:500], a["id"]))
+    with db() as c: a=c.execute("SELECT * FROM assessments WHERE chat_id=? AND status='await_org' ORDER BY id DESC LIMIT 1",(chat,)).fetchone()
     if a:
-        await send(chat_id, f"Орган: {text}\nПочинаємо оцінювання. Шкала 0–5.")
-        await ask_question(chat_id, a["id"], 0)
+        with db() as c: c.execute("UPDATE assessments SET organization=?,status=? WHERE id=?",(text[:500],'running' if a['mode']=='manual' else 'await_url',a['id']))
+        if a['mode']=='manual': await send(chat,f'Орган: {text}\nПочинаємо ручне оцінювання. Шкала 0–5.'); await ask_question(chat,a['id'],0)
+        else: await send(chat,'Введіть адресу офіційного вебсайту органу (URL).')
         return
-
-    # коментар до валідації
-    with db() as c:
-        a = c.execute("SELECT * FROM assessments WHERE chat_id=? AND status='await_validation_comment' ORDER BY id DESC LIMIT 1", (chat_id,)).fetchone()
-        if a:
-            c.execute("UPDATE assessments SET validation_comment=?, status='finished' WHERE id=?", (text[:2000], a["id"]))
+    with db() as c: a=c.execute("SELECT * FROM assessments WHERE chat_id=? AND status='await_url' ORDER BY id DESC LIMIT 1",(chat,)).fetchone()
     if a:
-        await send(chat_id, "Коментар збережено. Формую фінальний PDF-звіт…")
-        await finalize_and_archive(a["id"], chat_id)
-        await send(chat_id, "Додатково доступні: /report, /pdf, /xlsx, /bundle, /drive, /recommend")
+        if not re.match(r'^(https?://)?[A-Za-zА-Яа-я0-9.-]+\.[A-Za-zА-Яа-я]{2,}',text): await send(chat,'Введіть коректну адресу офіційного вебсайту, наприклад https://example.gov.ua'); return
+        url=text if text.startswith(('http://','https://')) else 'https://'+text
+        with db() as c:c.execute("UPDATE assessments SET official_url=?,status='ai_processing' WHERE id=?",(url,a['id']))
+        await run_ai_stage(chat,a['id']); return
+    with db() as c:a=c.execute("SELECT * FROM assessments WHERE chat_id=? AND status='await_validation_comment' ORDER BY id DESC LIMIT 1",(chat,)).fetchone()
+    if a:
+        with db() as c:c.execute("UPDATE assessments SET validation_comment=?,status='finished' WHERE id=?",(text[:2000],a['id']))
+        await send(chat,'Коментар збережено. Формую фінальний PDF-звіт…'); await finalize_and_archive(a['id'],chat); return
+    await send(chat,'Не розпізнав команду. /help')
+
+async def handle_callback(cb):
+    data=cb.get('data',''); chat=cb.get('message',{}).get('chat',{}).get('id');
+    if not chat:return
+    await tg('answerCallbackQuery',{'callback_query_id':cb['id']}); p=data.split(':')
+    if p[0]=='mode' and len(p)==3:
+        aid=int(p[1]); mode=p[2]
+        if mode not in MODE_LABEL:return
+        with db() as c:a=c.execute('SELECT * FROM assessments WHERE id=? AND chat_id=?',(aid,chat)).fetchone(); c.execute("UPDATE assessments SET mode=?,status='await_org' WHERE id=?",(mode,aid)) if a and a['status']=='await_mode' else None
+        if a and a['status']=='await_mode': await send(chat,f"Обрано: {MODE_LABEL[mode]}.\n\nНадішліть повну назву органу публічної влади.")
         return
-
-    await send(chat_id, "Не розпізнав команду. /help")
-
-
-async def handle_callback(cb: dict) -> None:
-    data = cb.get("data", "")
-    msg = cb.get("message", {})
-    chat_id = msg.get("chat", {}).get("id")
-    if not chat_id:
+    if p[0]=='score' and len(p)==4:
+        aid,idx,score=map(int,p[1:]); x=MATRIX[idx]
+        with db() as c:a=c.execute('SELECT * FROM assessments WHERE id=? AND chat_id=?',(aid,chat)).fetchone()
+        if not a or a['status']!='running':return
+        with db() as c:c.execute('INSERT OR REPLACE INTO answers(assessment_id,code,score,source,created_at) VALUES(?,?,?,?,?)',(aid,x['code'],score,'respondent',now_iso()))
+        await send(chat,f"{x['code']}: {score}/5 — {SCALE[score]}")
+        miss=missing_indices(aid)
+        if miss: await ask_question(chat,aid,miss[0])
+        else: await finish_assessment(chat,aid)
         return
-    await tg("answerCallbackQuery", {"callback_query_id": cb["id"]})
-    parts = data.split(":")
-    if parts[0] == "score" and len(parts) == 4:
-        aid, idx, score = map(int, parts[1:])
-        if idx < 0 or idx >= len(MATRIX) or score not in range(6): return
-        item=MATRIX[idx]
-        with db() as c:
-            a=c.execute("SELECT * FROM assessments WHERE id=? AND chat_id=?",(aid,chat_id)).fetchone()
-            if not a or a["status"]!='running': return
-            c.execute("INSERT OR REPLACE INTO answers(assessment_id,code,score,source,created_at) VALUES(?,?,?,?,?)",(aid,item["code"],score,"respondent",now_iso()))
-            c.execute("UPDATE assessments SET current_index=? WHERE id=?",(idx+1,aid))
-        await send(chat_id, f"{item['code']}: {score}/5 — {SCALE[score]}")
-        if idx+1 < len(MATRIX):
-            await ask_question(chat_id,aid,idx+1)
-        else:
-            await finish_assessment(chat_id,aid)
-        return
-    if parts[0] == "valid" and len(parts)==3:
-        aid=int(parts[1]); score=int(parts[2])
-        if score not in range(1,6): return
-        with db() as c:
-            a=c.execute("SELECT * FROM assessments WHERE id=? AND chat_id=?",(aid,chat_id)).fetchone()
-            if not a: return
-            c.execute("UPDATE assessments SET validation_score=?, status='await_validation_comment' WHERE id=?",(score,aid))
-        await send(chat_id, f"Відповідність: {score}/5.\nЗа бажанням надішліть короткий коментар, що саме оцінено неточно. Якщо коментар не потрібен — надішліть «-».")
+    if p[0]=='valid' and len(p)==3:
+        aid=int(p[1]); score=int(p[2]);
+        with db() as c:c.execute("UPDATE assessments SET validation_score=?,status='await_validation_comment' WHERE id=? AND chat_id=?",(score,aid,chat))
+        await send(chat,f'Відповідність: {score}/5.\nЗа бажанням надішліть короткий коментар. Якщо коментар не потрібен — надішліть «-».')
 
+async def process_update(upd):
+    if 'message' in upd: await handle_message(upd['message'])
+    elif 'callback_query' in upd: await handle_callback(upd['callback_query'])
 
-async def process_update(upd: dict) -> None:
-    if "message" in upd:
-        await handle_message(upd["message"])
-    elif "callback_query" in upd:
-        await handle_callback(upd["callback_query"])
-
-
-async def main() -> None:
-    # Локальний режим long polling. На Render використовується app.py + webhook.
-    init_db()
-    print("AI Maturity Bot started in polling mode")
-    offset = 0
+async def main():
+    import asyncio
+    init_db(); offset=0
     while True:
         try:
-            updates = await tg("getUpdates", {"offset": offset, "timeout": POLL_TIMEOUT, "allowed_updates": ["message", "callback_query"]})
-            for upd in updates:
-                offset = max(offset, upd["update_id"] + 1)
-                try:
-                    await process_update(upd)
-                except Exception as e:
-                    print("Update error:", repr(e))
-        except Exception as e:
-            print("Polling error:", repr(e))
-            await asyncio.sleep(3)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+            ups=await tg('getUpdates',{'offset':offset,'timeout':POLL_TIMEOUT,'allowed_updates':['message','callback_query']})
+            for u in ups:
+                offset=max(offset,u['update_id']+1); await process_update(u)
+        except Exception as e: print('Polling error:',repr(e)); await asyncio.sleep(3)
+if __name__=='__main__':
+    import asyncio; asyncio.run(main())

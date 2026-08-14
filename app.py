@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 from flask import Flask, jsonify, request
 import httpx
 
@@ -18,12 +19,26 @@ def run_async(coro):
     return asyncio.run(coro)
 
 
+def run_update_background(update: dict):
+    """Process Telegram update outside the HTTP request.
+    This is required because free-tier Groq analysis may take several minutes.
+    """
+    def worker():
+        try:
+            asyncio.run(bot.process_update(update))
+        except Exception as exc:
+            print("Background update error:", bot._safe_log_text(repr(exc)), flush=True)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
 @app.get("/")
 def index():
     return jsonify({
         "service": "AI Maturity Telegram Bot",
         "status": "ok",
         "mode": "webhook",
+        "version": "0.4.4",
     })
 
 
@@ -38,18 +53,15 @@ def telegram_webhook():
         supplied = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
         if supplied != WEBHOOK_SECRET:
             return "forbidden", 403
+
     update = request.get_json(silent=True) or {}
-    try:
-        run_async(bot.process_update(update))
-    except Exception as exc:
-        print("Webhook update error:", repr(exc), flush=True)
-        return "error", 500
+    # Acknowledge Telegram immediately; long AI work continues in background.
+    run_update_background(update)
     return "ok", 200
 
 
 @app.post("/admin/set-webhook")
 def set_webhook():
-    """Protected by WEBHOOK_SECRET header; useful for manual reset."""
     if not WEBHOOK_SECRET:
         return jsonify({"ok": False, "error": "TELEGRAM_WEBHOOK_SECRET is not configured"}), 400
     supplied = request.headers.get("X-Admin-Secret", "")
@@ -78,8 +90,19 @@ def register_webhook(base_url: str) -> dict:
     return data
 
 
+def configure_bot_ui():
+    try:
+        asyncio.run(bot.configure_telegram_ui())
+    except Exception as exc:
+        print("Telegram UI startup warning:", bot._safe_log_text(repr(exc)), flush=True)
+
+
 if RENDER_EXTERNAL_URL:
     try:
         register_webhook(RENDER_EXTERNAL_URL)
     except Exception as exc:
-        print("Webhook registration warning:", repr(exc), flush=True)
+        print("Webhook registration warning:", bot._safe_log_text(repr(exc)), flush=True)
+
+# Important: webhook deployment uses app.py, not bot.py's __main__.
+# Therefore profile description/commands must be configured here.
+configure_bot_ui()

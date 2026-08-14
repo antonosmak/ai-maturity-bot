@@ -154,11 +154,12 @@ async def configure_telegram_ui():
         })
         await tg('setMyDescription',{
             'description':(
-                'AI Maturity Bot — дослідницький інструмент для оцінювання AI-зрілості '
-                'органів публічної влади. Підтримує автоматичний ШІ-аналіз офіційного '
-                'вебсайту та відкритих джерел, аналіз з підкріпленням і ручне оцінювання. '
-                'Результати мають експериментальний характер і не є офіційною оцінкою. '
-                '/start — розпочати оцінювання. ©2026, Антон Осьмак'
+                'AI Maturity Bot — дослідницький інструмент оцінювання AI-зрілості '
+                'органів публічної влади. Доступні: автоматичний ШІ-аналіз сайту й '
+                'відкритих джерел, ШІ-аналіз з підкріпленням та ручний режим. '
+                'Результати експериментальні й не є офіційною оцінкою.\n'
+                '/start — розпочати оцінювання\n'
+                '©2026, Антон Осьмак'
             )
         })
         print('Telegram command menu and descriptions configured',flush=True)
@@ -292,6 +293,8 @@ def _criteria_batches():
     return batches
 
 async def ai_assess(aid,organization,url):
+    import asyncio
+
     provider=AI_PROVIDER
     _diag('start',aid,provider=provider,organization=organization,url=url)
 
@@ -312,73 +315,59 @@ async def ai_assess(aid,organization,url):
     else:
         raise RuntimeError(f'Невідомий AI_PROVIDER: {provider}')
 
-    # Official-site crawling remains optional evidence, never a hard dependency.
+    # Site reading is only auxiliary. Keep the excerpt very small because the
+    # Groq free tier in the current account enforces a low TPM ceiling.
     try:
         corpus,pages=await crawl_official_site(url)
     except Exception as e:
         print('Official-site crawl warning:',_safe_log_text(e),flush=True)
         corpus,pages='',0
 
-    # Keep the official-site excerpt compact so free-tier Groq requests remain under TPM limits.
-    official_excerpt=(corpus[:12000] if corpus.strip() else
-        '[Офіційний сайт не вдалося автоматично прочитати з Render. '
-        'Не трактуй це як відсутність відповідних практик. Використовуй вебпошук.]')
+    official_excerpt=(corpus[:2500] if corpus.strip() else
+        '[Сайт не вдалося автоматично прочитати. Використовуй вебпошук і пріоритетно офіційні джерела.]')
 
     batches=_criteria_batches()
     total_saved=0
     notes=[]
     allowed={x['code'] for x in MATRIX}
 
+    with db() as c:
+        ar=c.execute('SELECT chat_id FROM assessments WHERE id=?',(aid,)).fetchone()
+        chat_id=ar['chat_id'] if ar else None
+
     headers={
         'Authorization':f'Bearer {api_key}',
         'Content-Type':'application/json'
     }
 
-    # One request per D1–D8 block instead of one huge 48-item request.
     for batch_no,(dim,criteria) in enumerate(batches,1):
+        # Compact prompt: the previous diagnostic showed that a D1 request
+        # requested >10K tokens against an 8K Groq TPM limit.
         prompt=f"""
-Ти — дослідницький модуль AI Maturity Bot для доказового оцінювання AI-зрілості
-органу публічної влади.
+Оціни AI-зрілість органу публічної влади лише за наведеними критеріями.
 
-ОРГАН: {organization}
-ОФІЦІЙНИЙ САЙТ: {url}
-БЛОК ОЦІНЮВАННЯ: {dim}
-ПАКЕТ: {batch_no} із {len(batches)}
+Орган: {organization}
+Офіційний сайт: {url}
+Блок: {dim}
 
-МЕТОД:
-1. Проведи вебпошук за повною назвою органу, скороченнями та тематикою критеріїв цього пакета.
-2. Пріоритет доказів:
-   A — офіційний сайт органу, його документи, рішення, звіти, відкриті дані;
-   B — інші офіційні державні/муніципальні джерела, реєстри, Prozorro тощо;
-   C — міжнародні організації, наукові та професійні аналітичні джерела;
-   D — надійні ЗМІ та матеріали партнерів/постачальників.
-3. Відсутність публічного доказу НЕ означає нульову зрілість.
-4. Для кожного критерію постав score 0–5 лише коли є достатня доказова база.
-   Якщо доказів недостатньо, score=null.
-5. Не домислюй внутрішні процеси.
-6. За суперечливих джерел знизь confidence.
-7. Для кожної визначеної оцінки наведи 1–3 конкретні URL-джерела.
-8. Поверни ЛИШЕ JSON без markdown.
+Правила:
+- шукай у вебі за назвою органу, офіційним доменом і змістом критерію;
+- пріоритет: офіційний сайт/документи -> інші офіційні джерела -> надійні аналітичні джерела/ЗМІ;
+- відсутність доказу не означає 0;
+- score 0–5 став лише за достатнього доказу, інакше score=null;
+- не домислюй внутрішні процеси;
+- для визначеної оцінки дай 1–2 URL;
+- поверни лише JSON.
 
-ФОРМАТ:
-{{
-  "items":[
-    {{
-      "code":"D1.1",
-      "score":0,
-      "evidence":"Стислий фактичний доказ",
-      "rationale":"Чому доказ відповідає балу",
-      "confidence":0.0,
-      "sources":[{{"title":"Назва джерела","url":"https://..."}}]
-    }}
-  ],
-  "research_note":"Коротко про використані джерела та обмеження"
-}}
+JSON:
+{{"items":[{{"code":"D1.1","score":0,"evidence":"факт","rationale":"обґрунтування","confidence":0.0,
+"sources":[{{"title":"джерело","url":"https://..."}}]}}],
+"research_note":"коротко про джерела/обмеження"}}
 
-КРИТЕРІЇ ЦЬОГО ПАКЕТА:
-{json.dumps(criteria,ensure_ascii=False)}
+Критерії:
+{json.dumps(criteria,ensure_ascii=False,separators=(',',':'))}
 
-КОРОТКИЙ КОРПУС ОФІЦІЙНОГО САЙТУ:
+Короткий фрагмент офіційного сайту:
 {official_excerpt}
 """.strip()
 
@@ -388,7 +377,8 @@ async def ai_assess(aid,organization,url):
                 'input':prompt,
                 'tools':[{'type':'browser_search'}],
                 'tool_choice':'required',
-                'max_output_tokens':5000
+                # Keep requested tokens safely below the free-tier TPM ceiling.
+                'max_output_tokens':1600
             }
         else:
             payload={
@@ -397,9 +387,9 @@ async def ai_assess(aid,organization,url):
                 'tools':[{
                     'type':'web_search',
                     'external_web_access':True,
-                    'search_context_size':'medium'
+                    'search_context_size':'low'
                 }],
-                'max_output_tokens':5000
+                'max_output_tokens':2000
             }
 
         _diag('batch_start',aid,batch=batch_no,dimension=dim,criteria=len(criteria))
@@ -408,24 +398,20 @@ async def ai_assess(aid,organization,url):
         try:
             async with httpx.AsyncClient(timeout=300,follow_redirects=True) as c:
                 resp=await c.post(endpoint,headers=headers,json=payload)
-            _diag(
-                'response_received',aid,provider=provider,status=resp.status_code,
-                request_id=resp.headers.get('x-request-id',''),
-                content_type=resp.headers.get('content-type',''),
-                batch=batch_no,dimension=dim
-            )
+            _diag('response_received',aid,provider=provider,status=resp.status_code,
+                  request_id=resp.headers.get('x-request-id',''),
+                  content_type=resp.headers.get('content-type',''),
+                  batch=batch_no,dimension=dim)
         except Exception as e:
-            _diag('transport_error',aid,batch=batch_no,dimension=dim,error_type=type(e).__name__,detail=str(e))
+            _diag('transport_error',aid,batch=batch_no,dimension=dim,
+                  error_type=type(e).__name__,detail=str(e))
             raise RuntimeError(f'Помилка з’єднання з AI-провайдером {provider}.') from None
 
         if resp.status_code>=400:
             body=_safe_log_text(resp.text[:2500])
             rid=resp.headers.get('x-request-id','')
-            print(
-                f'{provider} API error: status={resp.status_code} request_id={rid} '
-                f'batch={batch_no} dimension={dim} body={body}',
-                flush=True
-            )
+            print(f'{provider} API error: status={resp.status_code} request_id={rid} '
+                  f'batch={batch_no} dimension={dim} body={body}',flush=True)
             raise RuntimeError(
                 f'AI-провайдер {provider} повернув HTTP {resp.status_code} '
                 f'під час аналізу блоку {dim}.'
@@ -437,12 +423,12 @@ async def ai_assess(aid,organization,url):
                   top_keys=','.join(list(data.keys())[:20]) if isinstance(data,dict) else type(data).__name__)
         except Exception as e:
             _diag('json_parse_error',aid,batch=batch_no,dimension=dim,
-                  error_type=type(e).__name__,detail=str(e),body_preview=resp.text[:1200])
+                  error_type=type(e).__name__,detail=str(e),body_preview=resp.text[:1000])
             raise RuntimeError(f'AI-провайдер {provider} повернув некоректну JSON-відповідь.') from None
 
         model_text=_response_output_text(data)
         _diag('output_text_extracted',aid,batch=batch_no,dimension=dim,
-              chars=len(model_text or ''),preview=(model_text or '')[:250])
+              chars=len(model_text or ''),preview=(model_text or '')[:220])
 
         try:
             obj=_json_from_model_text(model_text)
@@ -450,7 +436,7 @@ async def ai_assess(aid,organization,url):
                   keys=','.join(list(obj.keys())[:20]) if isinstance(obj,dict) else '')
         except Exception as e:
             _diag('assessment_json_error',aid,batch=batch_no,dimension=dim,
-                  error_type=type(e).__name__,detail=str(e),text_preview=(model_text or '')[:1200])
+                  error_type=type(e).__name__,detail=str(e),text_preview=(model_text or '')[:1000])
             raise
 
         saved_this=0
@@ -463,7 +449,7 @@ async def ai_assess(aid,organization,url):
 
                 sources=x.get('sources') or []
                 src_lines=[]
-                for src in sources[:3]:
+                for src in sources[:2]:
                     if isinstance(src,dict):
                         title=str(src.get('title') or '').strip()
                         surl=str(src.get('url') or '').strip()
@@ -490,8 +476,8 @@ async def ai_assess(aid,organization,url):
                     'VALUES(?,?,?,?,?,?,?,?)',
                     (
                         aid,code,score,'ai',
-                        evidence[:4000],
-                        str(x.get('rationale') or '')[:1800],
+                        evidence[:3500],
+                        str(x.get('rationale') or '')[:1500],
                         conf,now_iso()
                     )
                 )
@@ -502,6 +488,15 @@ async def ai_assess(aid,organization,url):
         if note:
             notes.append(f'{dim}: {note}')
         _diag('batch_saved',aid,batch=batch_no,dimension=dim,saved=saved_this,total_saved=total_saved)
+
+        if chat_id:
+            await send(chat_id,f'ШІ-аналіз: завершено {dim} ({batch_no}/{len(batches)}).')
+
+        # The current Groq free tier on this account reports 8K TPM.
+        # Pacing avoids the next dimension immediately exhausting the same minute bucket.
+        if provider=='groq' and batch_no < len(batches):
+            _diag('rate_limit_pause',aid,seconds=65,next_batch=batch_no+1)
+            await asyncio.sleep(65)
 
     with db() as c:
         note=(
@@ -526,7 +521,7 @@ async def run_ai_stage(chat,aid):
         chat,
         'Виконую пакетний ШІ-аналіз офіційного вебсайту та відкритих джерел за блоками D1–D8. '
         'Якщо офіційний сайт технічно недоступний для автоматичного читання, '
-        'оцінювання продовжиться за відкритими джерелами. Це може тривати кілька хвилин…'
+        'оцінювання продовжиться за відкритими джерелами. У безкоштовному режимі Groq аналіз виконується послідовно за D1–D8 і може тривати близько 8–10 хвилин…'
     )
     try:
         saved,pages=await ai_assess(aid,a['organization'],a['official_url'])
@@ -672,7 +667,7 @@ async def handle_message(msg):
         )
         await send_start_welcome(chat,welcome); return
     if text=='/help':
-        await send(chat,'AI Maturity Bot — v0.4.3\n\n/new — нове оцінювання\n/status — стан\n/log — журнал\n/report [ID] — короткий звіт\n/pdf [ID] — PDF\n/xlsx [ID] — Excel\n/bundle [ID] — пакет\n/drive [ID] — архівувати пакет\n/export [ID] — JSON audit log\n/cancel — скасувати'); return
+        await send(chat,'AI Maturity Bot — v0.4.4\n\n/new — нове оцінювання\n/status — стан\n/log — журнал\n/report [ID] — короткий звіт\n/pdf [ID] — PDF\n/xlsx [ID] — Excel\n/bundle [ID] — пакет\n/drive [ID] — архівувати пакет\n/export [ID] — JSON audit log\n/cancel — скасувати'); return
     if text in ('/new','▶️ Розпочати оцінювання'): await start_assessment(chat,user); return
     if text=='/cancel':
         with db() as c: a=c.execute("SELECT id FROM assessments WHERE chat_id=? AND status NOT IN ('finished','cancelled') ORDER BY id DESC LIMIT 1",(chat,)).fetchone();

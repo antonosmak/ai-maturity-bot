@@ -59,10 +59,36 @@ def calc_results(aid):
 
 async def tg(method,payload=None,files=None):
     async with httpx.AsyncClient(timeout=max(POLL_TIMEOUT+10,45)) as c:
-        r=await c.post(f'{API}/{method}',data=payload or {} if files else None,json=None if files else payload or {},files=files); r.raise_for_status(); j=r.json(); return j.get('result')
+        r=await c.post(
+            f'{API}/{method}',
+            data=(payload or {}) if files else None,
+            json=None if files else (payload or {}),
+            files=files
+        )
+        if r.status_code >= 400:
+            body=r.text[:1500]
+            print(f'Telegram API error: method={method} status={r.status_code} body={body}',flush=True)
+            raise RuntimeError(f'Telegram {method}: HTTP {r.status_code}: {body}')
+        j=r.json()
+        if not j.get('ok',True):
+            raise RuntimeError(j)
+        return j.get('result')
 async def send(chat,text,keyboard=None):
-    p={'chat_id':chat,'text':text};
-    if keyboard: p['reply_markup']={'inline_keyboard':keyboard}
+    p={'chat_id':chat,'text':text}
+    if keyboard:
+        p['reply_markup']={'inline_keyboard':keyboard}
+    await tg('sendMessage',p)
+
+async def send_start_welcome(chat,text):
+    p={
+        'chat_id':chat,
+        'text':text,
+        'reply_markup':{
+            'keyboard':[[{'text':'▶️ Розпочати оцінювання'}]],
+            'resize_keyboard':True,
+            'one_time_keyboard':False
+        }
+    }
     await tg('sendMessage',p)
 async def send_document(chat,path,caption=''):
     with path.open('rb') as f: await tg('sendDocument',{'chat_id':str(chat),'caption':caption},{'document':(path.name,f,mimetypes.guess_type(path.name)[0] or 'application/octet-stream')})
@@ -75,6 +101,9 @@ def validation_keyboard(aid): return [[{'text':str(s),'callback_data':f'valid:{a
 
 def repeat_keyboard(aid):
     return [[{'text':'🔄 Повторити оцінювання','callback_data':f'repeat:{aid}'}]]
+
+def error_home_keyboard(aid):
+    return [[{'text':'↩️ Повернутися на стартовий екран','callback_data':f'errorhome:{aid}'}]]
 
 def normalize_official_url(text: str) -> str | None:
     """Нормалізує URL або домен офіційного сайту.
@@ -135,41 +164,237 @@ async def crawl_official_site(url,max_pages=12,max_chars=70000):
             except Exception: pass
     return '\n\n'.join(docs)[:max_chars],len(seen)
 
+def _response_output_text(data):
+    """Extract text from Responses API JSON without depending on the OpenAI SDK."""
+    if isinstance(data.get('output_text'), str) and data.get('output_text').strip():
+        return data['output_text'].strip()
+    chunks=[]
+    for item in data.get('output',[]) or []:
+        if not isinstance(item,dict) or item.get('type')!='message':
+            continue
+        for c in item.get('content',[]) or []:
+            if isinstance(c,dict) and c.get('type') in ('output_text','text') and c.get('text'):
+                chunks.append(str(c['text']))
+    return '\n'.join(chunks).strip()
+
+def _json_from_model_text(s):
+    """Accept a plain JSON object or JSON wrapped in a markdown fence."""
+    s=(s or '').strip()
+    if s.startswith('```'):
+        s=re.sub(r'^```(?:json)?\s*','',s,flags=re.I)
+        s=re.sub(r'\s*```$','',s)
+    try:
+        return json.loads(s)
+    except Exception:
+        m=re.search(r'\{.*\}',s,re.S)
+        if not m:
+            raise RuntimeError('ШІ не повернув структурований JSON-результат.')
+        return json.loads(m.group(0))
+
 async def ai_assess(aid,organization,url):
-    if not OPENAI_API_KEY or not OPENAI_MODEL: raise RuntimeError('Для ШІ-режиму потрібно задати OPENAI_API_KEY та OPENAI_MODEL у Render.')
-    corpus,pages=await crawl_official_site(url)
-    if not corpus.strip(): raise RuntimeError('Не вдалося отримати текст з офіційного вебсайту.')
-    criteria=[{'code':x['code'],'criterion':x['criterion'],'statement':x['statement']} for x in MATRIX]
-    prompt=f'''Ти — дослідницький модуль оцінювання AI-зрілості органу публічної влади.\nОрган: {organization}\nОфіційний сайт: {url}\nОціни кожен критерій 0–5 ТІЛЬКИ якщо наведений корпус офіційного сайту містить достатній прямий доказ. Якщо доказів недостатньо — score=null. Не домислюй внутрішні практики. Поверни ТІЛЬКИ JSON-об'єкт виду {{"items":[{{"code":"D1.1","score":0..5|null,"evidence":"коротка фактична підстава + URL","rationale":"коротке обґрунтування","confidence":0..1}}]}}.\nКритерії: {json.dumps(criteria,ensure_ascii=False)}\n\nКОРПУС ОФІЦІЙНОГО САЙТУ:\n{corpus}'''
-    headers={'Authorization':f'Bearer {OPENAI_API_KEY}','Content-Type':'application/json'}; payload={'model':OPENAI_MODEL,'input':prompt}
-    async with httpx.AsyncClient(timeout=180) as c: resp=await c.post('https://api.openai.com/v1/responses',headers=headers,json=payload); resp.raise_for_status(); data=resp.json()
-    text=data.get('output_text','')
-    if not text:
-        text=''.join(z.get('text','') for o in data.get('output',[]) for z in o.get('content',[]) if z.get('text'))
-    m=re.search(r'\{.*\}',text,re.S)
-    if not m: raise RuntimeError('ШІ не повернув структурований результат.')
-    obj=json.loads(m.group(0)); allowed={x['code'] for x in MATRIX}; saved=0
+    if not OPENAI_API_KEY or not OPENAI_MODEL:
+        raise RuntimeError('Для ШІ-режиму потрібно задати OPENAI_API_KEY та OPENAI_MODEL у Render.')
+
+    # Official-site crawling is useful evidence, but it is no longer a hard dependency.
+    # If the site blocks Render or returns no parseable text, the analysis continues
+    # with OpenAI Web Search over public sources.
+    try:
+        corpus,pages=await crawl_official_site(url)
+    except Exception as e:
+        print('Official-site crawl warning:',repr(e),flush=True)
+        corpus,pages='',0
+
+    criteria=[{
+        'code':x['code'],
+        'dimension':x.get('dimension'),
+        'dimension_name':x.get('dimension_name'),
+        'criterion':x['criterion'],
+        'statement':x['statement']
+    } for x in MATRIX]
+
+    official_excerpt=(corpus[:45000] if corpus.strip() else
+        '[Офіційний сайт не вдалося автоматично прочитати з Render. '
+        'Не трактуй це як відсутність відповідних практик. Використай вебпошук, '
+        'зокрема пошук сторінок офіційного домену та інших відкритих джерел.]')
+
+    prompt=f"""
+Ти — дослідницький модуль AI Maturity Bot для доказового оцінювання AI-зрілості
+органу публічної влади.
+
+ОРГАН: {organization}
+ОФІЦІЙНИЙ САЙТ: {url}
+
+МЕТОД:
+1. Проведи вебпошук за повною назвою органу, скороченнями та тематикою кожного критерію.
+2. Пріоритет доказів:
+   A — офіційний сайт органу, його документи, рішення, звіти, відкриті дані;
+   B — інші офіційні державні/муніципальні джерела, реєстри, Prozorro тощо;
+   C — міжнародні організації, наукові та професійні аналітичні джерела;
+   D — надійні ЗМІ та матеріали партнерів/постачальників.
+3. Не роби висновок лише з відсутності інформації. Відсутність публічного доказу ≠ нульова зрілість.
+4. Для кожного з 48 критеріїв постав score 0–5 ЛИШЕ коли є достатня доказова база.
+   Якщо доказів недостатньо, неоднозначні або вони не стосуються саме цього органу — score=null.
+5. Не домислюй внутрішні процеси, кадрові компетентності, політики, системи чи практики.
+6. Якщо є суперечливі джерела — відобрази це у rationale і знизь confidence.
+7. Для кожної визначеної оцінки наведи 1–3 конкретні URL-джерела.
+8. Evidence має бути стислим фактичним описом того, що саме підтверджує оцінку.
+9. Поверни ЛИШЕ JSON без markdown і без пояснень поза JSON.
+
+ФОРМАТ:
+{{
+  "items": [
+    {{
+      "code": "D1.1",
+      "score": 0,
+      "evidence": "Стислий фактичний доказ",
+      "rationale": "Чому цей доказ відповідає саме такому балу",
+      "confidence": 0.0,
+      "sources": [
+        {{"title": "Назва джерела", "url": "https://..."}}
+      ]
+    }}
+  ],
+  "research_note": "Коротко: які типи джерел використано та які були обмеження"
+}}
+
+КРИТЕРІЇ:
+{json.dumps(criteria,ensure_ascii=False)}
+
+ДОДАТКОВИЙ КОРПУС, ЯКЩО ВДАЛОСЯ ПРОЧИТАТИ ОФІЦІЙНИЙ САЙТ:
+{official_excerpt}
+""".strip()
+
+    headers={
+        'Authorization':f'Bearer {OPENAI_API_KEY}',
+        'Content-Type':'application/json'
+    }
+    payload={
+        'model':OPENAI_MODEL,
+        'tools':[{
+            'type':'web_search',
+            'external_web_access':True,
+            'search_context_size':'high'
+        }],
+        'input':prompt,
+        'max_output_tokens':14000
+    }
+
+    async with httpx.AsyncClient(timeout=300,follow_redirects=True) as c:
+        resp=await c.post('https://api.openai.com/v1/responses',headers=headers,json=payload)
+        if resp.status_code>=400:
+            body=resp.text[:2500]
+            rid=resp.headers.get('x-request-id','')
+            print(f'OpenAI API error: status={resp.status_code} request_id={rid} body={body}',flush=True)
+            raise RuntimeError(f'OpenAI API HTTP {resp.status_code}: {body}')
+        data=resp.json()
+
+    model_text=_response_output_text(data)
+    obj=_json_from_model_text(model_text)
+    allowed={x['code'] for x in MATRIX}
+    saved=0
+
     with db() as c:
-        for x in obj.get('items',[]):
-            if x.get('code') not in allowed or not isinstance(x.get('score'),int) or x['score'] not in range(6): continue
-            c.execute('INSERT OR REPLACE INTO answers(assessment_id,code,score,source,evidence,rationale,confidence,created_at) VALUES(?,?,?,?,?,?,?,?)',(aid,x['code'],x['score'],'ai',str(x.get('evidence',''))[:2000],str(x.get('rationale',''))[:1000],x.get('confidence'),now_iso())); saved+=1
-        c.execute('UPDATE assessments SET coverage=?,ai_note=? WHERE id=?',(saved/len(MATRIX)*100,f'Проаналізовано сторінок: {pages}',aid))
+        for x in obj.get('items',[]) or []:
+            code=x.get('code')
+            score=x.get('score')
+            if code not in allowed or not isinstance(score,int) or score not in range(6):
+                continue
+
+            sources=x.get('sources') or []
+            src_lines=[]
+            for s in sources[:3]:
+                if isinstance(s,dict):
+                    title=str(s.get('title') or '').strip()
+                    surl=str(s.get('url') or '').strip()
+                    if surl:
+                        src_lines.append((title+' — ' if title else '')+surl)
+                elif isinstance(s,str) and s.strip():
+                    src_lines.append(s.strip())
+
+            evidence=str(x.get('evidence') or '').strip()
+            if src_lines:
+                evidence=(evidence+'\nДжерела:\n'+'\n'.join(src_lines)).strip()
+
+            conf=x.get('confidence')
+            try:
+                conf=float(conf) if conf is not None else None
+                if conf is not None:
+                    conf=max(0.0,min(1.0,conf))
+            except Exception:
+                conf=None
+
+            c.execute(
+                'INSERT OR REPLACE INTO answers'
+                '(assessment_id,code,score,source,evidence,rationale,confidence,created_at) '
+                'VALUES(?,?,?,?,?,?,?,?)',
+                (
+                    aid,code,score,'ai',
+                    evidence[:4000],
+                    str(x.get('rationale') or '')[:1800],
+                    conf,now_iso()
+                )
+            )
+            saved+=1
+
+        note=(
+            f"Метод: ШІ-аналіз офіційного вебсайту та відкритих джерел. "
+            f"Автоматично прочитано сторінок офіційного сайту: {pages}. "
+            f"{str(obj.get('research_note') or '').strip()}"
+        ).strip()
+        c.execute(
+            'UPDATE assessments SET coverage=?,ai_note=? WHERE id=?',
+            (saved/len(MATRIX)*100,note[:4000],aid)
+        )
     return saved,pages
 
 async def run_ai_stage(chat,aid):
-    with db() as c: a=c.execute('SELECT * FROM assessments WHERE id=?',(aid,)).fetchone()
-    await send(chat,'Виконую ШІ-аналіз офіційного вебсайту. Це може тривати кілька хвилин…')
-    try: saved,pages=await ai_assess(aid,a['organization'],a['official_url'])
+    with db() as c:
+        a=c.execute('SELECT * FROM assessments WHERE id=?',(aid,)).fetchone()
+
+    await send(
+        chat,
+        'Виконую ШІ-аналіз офіційного вебсайту та відкритих джерел. '
+        'Якщо офіційний сайт технічно недоступний для автоматичного читання, '
+        'оцінювання продовжиться за відкритими джерелами. Це може тривати кілька хвилин…'
+    )
+    try:
+        saved,pages=await ai_assess(aid,a['organization'],a['official_url'])
     except Exception as e:
-        with db() as c: c.execute("UPDATE assessments SET status='await_url' WHERE id=?",(aid,))
-        await send(chat,f'ШІ-аналіз не виконано: {type(e).__name__}: {e}'); return
-    miss=missing_indices(aid); mode=a['mode']
-    await send(chat,f'Автоматичний етап завершено. Визначено {saved} із 48 показників. Не визначено: {len(miss)}.')
+        # A failed AI run is closed so the user can immediately start again.
+        with db() as c:
+            c.execute("UPDATE assessments SET status='cancelled' WHERE id=?",(aid,))
+        print(f'AI assessment error aid={aid}: {type(e).__name__}: {e}',flush=True)
+        await send(
+            chat,
+            '⚠️ Під час оцінювання сталася помилка.\n\n'
+            f'{type(e).__name__}: {e}\n\n'
+            'Натисніть кнопку нижче, щоб повернутися на стартовий екран.',
+            error_home_keyboard(aid)
+        )
+        return
+
+    miss=missing_indices(aid)
+    mode=a['mode']
+    await send(
+        chat,
+        f'Автоматичний етап завершено. Визначено {saved} із 48 показників. '
+        f'Не визначено: {len(miss)}.'
+    )
+
     if mode=='hybrid' and miss:
-        with db() as c: c.execute("UPDATE assessments SET status='running',current_index=? WHERE id=?",(miss[0],aid))
-        await send(chat,'Переходимо до підкріплення: необхідно уточнити лише показники, які ШІ не зміг визначити.')
+        with db() as c:
+            c.execute(
+                "UPDATE assessments SET status='running',current_index=? WHERE id=?",
+                (miss[0],aid)
+            )
+        await send(
+            chat,
+            'Переходимо до підкріплення: необхідно уточнити лише показники, '
+            'які ШІ не зміг надійно визначити за сайтом та відкритими джерелами.'
+        )
         await ask_question(chat,aid,miss[0])
-    else: await finish_assessment(chat,aid)
+    else:
+        await finish_assessment(chat,aid)
 
 def make_radar(aid,org):
     r=calc_results(aid); labels=[d[0] for d in DIMENSIONS]; values=[r['dims'][d] or 0 for d in labels]; vals=values+values[:1]; ang=np.linspace(0,2*np.pi,len(labels),endpoint=False).tolist()+[0]
@@ -216,8 +441,8 @@ def export_pdf(aid):
     doc=SimpleDocTemplate(str(out),pagesize=A4,rightMargin=12*mm,leftMargin=12*mm,topMargin=12*mm,bottomMargin=18*mm); story=[Paragraph('AI Maturity Assessment',st['T']),Paragraph('Звіт за результатами оцінювання AI-зрілості органу публічної влади',st['H'])]
     meta=[['Орган',a.get('organization') or ''],['Офіційний сайт',a.get('official_url') or '—'],['Режим оцінювання',MODE_LABEL.get(a.get('mode'),a.get('mode') or '—')],['AIMI',f"{r['aimi']:.1f}%"],['Повнота оцінювання',f"{r['coverage']:.1f}% ({len(r['scores'])}/48)"],['Рівень',maturity_level(r['aimi'])]]
     t=Table([[Paragraph(str(v),st['U']) for v in row] for row in meta],colWidths=[45*mm,135*mm]); t.setStyle(TableStyle([('GRID',(0,0),(-1,-1),.4,colors.grey),('FONTNAME',(0,0),(-1,-1),font),('FONTNAME',(0,0),(0,-1),bold),('VALIGN',(0,0),(-1,-1),'TOP')])); story += [t,Spacer(1,5*mm)]
-    if a.get('mode')=='ai': story.append(Paragraph('Примітка: це ШІ-аналіз, виконаний на основі інформації з офіційного вебсайту органу та відкритих джерел. Показники, для яких не знайдено достатньої доказової інформації, позначено «не визначено».',st['U']))
-    elif a.get('mode')=='hybrid': story.append(Paragraph('Примітка: це ШІ-аналіз з підкріпленням. Первинне оцінювання виконано ШІ на основі офіційного вебсайту органу та відкритих джерел; показники, для яких не знайдено достатньої доказової інформації, додатково уточнено респондентом.',st['U']))
+    if a.get('mode')=='ai': story.append(Paragraph('Примітка: це ШІ-аналіз на основі офіційного вебсайту органу та відкритих джерел із використанням вебпошуку. Показники, для яких не знайдено достатньої доказової інформації, позначено «не визначено».',st['U']))
+    elif a.get('mode')=='hybrid': story.append(Paragraph('Примітка: це ШІ-аналіз з підкріпленням. Первинне оцінювання виконано ШІ на основі офіційного вебсайту органу та відкритих джерел із використанням вебпошуку; показники, для яких не знайдено достатньої доказової інформації, додатково уточнено респондентом.',st['U']))
     elif a.get('mode')=='manual': story.append(Paragraph('Примітка: оцінювання виконано в ручному режимі на основі відповідей респондента.',st['U']))
     story += [Image(str(make_radar(aid,a.get('organization') or 'Орган')),width=135*mm,height=135*mm),PageBreak(),Paragraph('Деталізація 48 показників',st['H'])]
     data=[['Код','Критерій','Бал','Джерело']]+[[x['code'],x['criterion'],str(x['score']) if x['score'] is not None else 'Не визначено',{'ai':'ШІ','respondent':'Респондент','ND':'Не визначено'}.get(x['source'],x['source'])] for x in ans]
@@ -273,10 +498,9 @@ async def handle_message(msg):
             'Для початку натисніть кнопку «Розпочати оцінювання».\n\n'
             '© 2026, Антон Осьмак'
         )
-        keyboard=[[{'text':'▶️ Розпочати оцінювання','callback_data':'start:new'}]]
-        await send(chat,welcome,keyboard); return
+        await send_start_welcome(chat,welcome); return
     if text=='/help':
-        await send(chat,'AI Maturity Bot — v0.3.5\n\n/new — нове оцінювання\n/status — стан\n/log — журнал\n/report [ID] — короткий звіт\n/pdf [ID] — PDF\n/xlsx [ID] — Excel\n/bundle [ID] — пакет\n/drive [ID] — архівувати пакет\n/export [ID] — JSON audit log\n/cancel — скасувати'); return
+        await send(chat,'AI Maturity Bot — v0.3.8\n\n/new — нове оцінювання\n/status — стан\n/log — журнал\n/report [ID] — короткий звіт\n/pdf [ID] — PDF\n/xlsx [ID] — Excel\n/bundle [ID] — пакет\n/drive [ID] — архівувати пакет\n/export [ID] — JSON audit log\n/cancel — скасувати'); return
     if text in ('/new','▶️ Розпочати оцінювання'): await start_assessment(chat,user); return
     if text=='/cancel':
         with db() as c: a=c.execute("SELECT id FROM assessments WHERE chat_id=? AND status NOT IN ('finished','cancelled') ORDER BY id DESC LIMIT 1",(chat,)).fetchone();
@@ -352,7 +576,8 @@ async def handle_callback(cb):
     data=cb.get('data',''); chat=cb.get('message',{}).get('chat',{}).get('id');
     if not chat:return
     await tg('answerCallbackQuery',{'callback_query_id':cb['id']}); p=data.split(':')
-    if p[0]=='start' and len(p)==2 and p[1]=='new':
+    if p[0]=='errorhome' and len(p)==2:
+        # Failed assessment is already cancelled; create a fresh start screen.
         await start_assessment(chat,cb.get('from',{}))
         return
     if p[0]=='repeat' and len(p)==2:

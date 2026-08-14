@@ -73,6 +73,32 @@ def mode_keyboard(aid): return [[{'text':'🤖 Повністю автомати
 def score_keyboard(aid,idx): return [[{'text':str(s),'callback_data':f'score:{aid}:{idx}:{s}'} for s in range(6)]]
 def validation_keyboard(aid): return [[{'text':str(s),'callback_data':f'valid:{aid}:{s}'} for s in range(1,6)]]
 
+def repeat_keyboard(aid):
+    return [[{'text':'🔄 Повторити оцінювання','callback_data':f'repeat:{aid}'}]]
+
+def normalize_official_url(text: str) -> str | None:
+    """Нормалізує URL або домен офіційного сайту.
+
+    Приймає https://example.gov.ua/, example.gov.ua, www.example.gov.ua
+    та прибирає випадкові пробіли.
+    """
+    raw=(text or '').strip().replace(' ', '')
+    if not raw:
+        return None
+    if not raw.startswith(('http://','https://')):
+        raw='https://'+raw
+    try:
+        u=urlparse(raw)
+    except Exception:
+        return None
+    host=(u.hostname or '').strip('.').lower()
+    if not host or '.' not in host:
+        return None
+    # домен повинен мати принаймні дві непорожні частини; IDN теж допускається
+    if any(not part for part in host.split('.')):
+        return None
+    return raw
+
 async def start_assessment(chat,user):
     with db() as c:
         active=c.execute("SELECT id FROM assessments WHERE chat_id=? AND status NOT IN ('finished','cancelled') ORDER BY id DESC LIMIT 1",(chat,)).fetchone()
@@ -176,14 +202,26 @@ def _fonts():
 
 def export_pdf(aid):
     a,ans,r=_payload(aid); out=BASE_DIR/'exports'/f'AI_Maturity_Assessment_{aid}.pdf'; out.parent.mkdir(parents=True,exist_ok=True); font,bold=_fonts(); st=getSampleStyleSheet(); st.add(ParagraphStyle(name='U',parent=st['BodyText'],fontName=font,fontSize=8.5,leading=11)); st.add(ParagraphStyle(name='H',parent=st['Heading2'],fontName=bold,fontSize=13)); st.add(ParagraphStyle(name='T',parent=st['Title'],fontName=bold,fontSize=17,alignment=TA_CENTER))
-    doc=SimpleDocTemplate(str(out),pagesize=A4,rightMargin=12*mm,leftMargin=12*mm,topMargin=12*mm,bottomMargin=12*mm); story=[Paragraph('AI Maturity Assessment',st['T']),Paragraph('Звіт за результатами оцінювання AI-зрілості органу публічної влади',st['H'])]
+    footer_text='AI Maturity Bot — дослідницький інформаційно-аналітичний інструмент для комплексного оцінювання AI-зрілості органів публічної влади. © Антон Осьмак · @AI_Maturity_Bot'
+    def draw_footer(canvas,doc):
+        canvas.saveState()
+        canvas.setFont(font,6.4)
+        width=A4[0]-24*mm
+        # Footer in two compact lines so it remains readable and does not collide with content.
+        line1='AI Maturity Bot — дослідницький інформаційно-аналітичний інструмент для комплексного оцінювання'
+        line2='AI-зрілості органів публічної влади. © 2026, Антон Осьмак · @AI_Maturity_Bot · ai.maturity.bot@gmail.com'
+        canvas.drawCentredString(A4[0]/2,8.0*mm,line1)
+        canvas.drawCentredString(A4[0]/2,5.0*mm,line2)
+        canvas.restoreState()
+    doc=SimpleDocTemplate(str(out),pagesize=A4,rightMargin=12*mm,leftMargin=12*mm,topMargin=12*mm,bottomMargin=18*mm); story=[Paragraph('AI Maturity Assessment',st['T']),Paragraph('Звіт за результатами оцінювання AI-зрілості органу публічної влади',st['H'])]
     meta=[['Орган',a.get('organization') or ''],['Офіційний сайт',a.get('official_url') or '—'],['Режим оцінювання',MODE_LABEL.get(a.get('mode'),a.get('mode') or '—')],['AIMI',f"{r['aimi']:.1f}%"],['Повнота оцінювання',f"{r['coverage']:.1f}% ({len(r['scores'])}/48)"],['Рівень',maturity_level(r['aimi'])]]
     t=Table([[Paragraph(str(v),st['U']) for v in row] for row in meta],colWidths=[45*mm,135*mm]); t.setStyle(TableStyle([('GRID',(0,0),(-1,-1),.4,colors.grey),('FONTNAME',(0,0),(-1,-1),font),('FONTNAME',(0,0),(0,-1),bold),('VALIGN',(0,0),(-1,-1),'TOP')])); story += [t,Spacer(1,5*mm)]
-    if a.get('mode')=='ai': story.append(Paragraph('Примітка: це ШІ-аналіз на основі інформації, доступної на офіційному вебсайті органу. Показники без достатніх доказів позначено «не визначено».',st['U']))
-    elif a.get('mode')=='hybrid': story.append(Paragraph('Примітка: це ШІ-аналіз з підкріпленням. Первинне оцінювання виконано ШІ за офіційним вебсайтом; невизначені показники уточнено респондентом.',st['U']))
+    if a.get('mode')=='ai': story.append(Paragraph('Примітка: це ШІ-аналіз, виконаний на основі інформації з офіційного вебсайту органу та відкритих джерел. Показники, для яких не знайдено достатньої доказової інформації, позначено «не визначено».',st['U']))
+    elif a.get('mode')=='hybrid': story.append(Paragraph('Примітка: це ШІ-аналіз з підкріпленням. Первинне оцінювання виконано ШІ на основі офіційного вебсайту органу та відкритих джерел; показники, для яких не знайдено достатньої доказової інформації, додатково уточнено респондентом.',st['U']))
+    elif a.get('mode')=='manual': story.append(Paragraph('Примітка: оцінювання виконано в ручному режимі на основі відповідей респондента.',st['U']))
     story += [Image(str(make_radar(aid,a.get('organization') or 'Орган')),width=135*mm,height=135*mm),PageBreak(),Paragraph('Деталізація 48 показників',st['H'])]
     data=[['Код','Критерій','Бал','Джерело']]+[[x['code'],x['criterion'],str(x['score']) if x['score'] is not None else 'Не визначено',{'ai':'ШІ','respondent':'Респондент','ND':'Не визначено'}.get(x['source'],x['source'])] for x in ans]
-    t=Table([[Paragraph(str(v),st['U']) for v in row] for row in data],colWidths=[16*mm,112*mm,25*mm,27*mm],repeatRows=1); t.setStyle(TableStyle([('GRID',(0,0),(-1,-1),.3,colors.grey),('FONTNAME',(0,0),(-1,0),bold),('VALIGN',(0,0),(-1,-1),'TOP')])); story += [t,PageBreak(),Paragraph('Рекомендації',st['H']),Paragraph((a.get('recommendations') or base_recommendations(aid)).replace('\n','<br/>'),st['U'])]; doc.build(story); return out
+    t=Table([[Paragraph(str(v),st['U']) for v in row] for row in data],colWidths=[16*mm,112*mm,25*mm,27*mm],repeatRows=1); t.setStyle(TableStyle([('GRID',(0,0),(-1,-1),.3,colors.grey),('FONTNAME',(0,0),(-1,0),bold),('VALIGN',(0,0),(-1,-1),'TOP')])); story += [t,PageBreak(),Paragraph('Рекомендації',st['H']),Paragraph((a.get('recommendations') or base_recommendations(aid)).replace('\n','<br/>'),st['U'])]; doc.build(story,onFirstPage=draw_footer,onLaterPages=draw_footer); return out
 
 def export_json(aid):
     a,ans,r=_payload(aid); out=BASE_DIR/'exports'/f'assessment_{aid}.json'; out.write_text(json.dumps({'assessment':a,'results':{k:v for k,v in r.items() if k!='scores'},'answers':ans},ensure_ascii=False,indent=2),encoding='utf-8'); return out
@@ -212,16 +250,34 @@ async def upload_to_google_drive(paths):
 async def finalize_and_archive(aid,chat):
     pdf=export_pdf(aid); await send_document(chat,pdf,'Фінальний PDF-звіт AI-зрілості')
     if GDRIVE_UPLOAD_URL and GDRIVE_UPLOAD_SECRET:
-        try: await upload_to_google_drive([pdf]); await send(chat,'Фінальний PDF-звіт сформовано. Копію результату збережено в журналі.')
-        except Exception as e: print('Drive auto-upload error:',repr(e),flush=True); await send(chat,'Фінальний PDF-звіт сформовано, але копію не вдалося зберегти в журналі.')
-    else: await send(chat,'Фінальний PDF-звіт сформовано.')
+        try: await upload_to_google_drive([pdf]); await send(chat,'Фінальний PDF-звіт сформовано. Копію результату збережено в журналі.',repeat_keyboard(aid))
+        except Exception as e: print('Drive auto-upload error:',repr(e),flush=True); await send(chat,'Фінальний PDF-звіт сформовано, але копію не вдалося зберегти в журналі.',repeat_keyboard(aid))
+    else: await send(chat,'Фінальний PDF-звіт сформовано.',repeat_keyboard(aid))
 
 async def handle_message(msg):
     chat=msg['chat']['id']; user=msg.get('from',{}); text=(msg.get('text') or '').strip()
     if not text:return
-    if text in ('/start','/help'):
-        await send(chat,'AI Maturity Bot — v0.3\n\n/new — нове оцінювання\n/status — стан\n/log — журнал\n/report [ID] — короткий звіт\n/pdf [ID] — PDF\n/xlsx [ID] — Excel\n/bundle [ID] — пакет\n/drive [ID] — архівувати пакет\n/export [ID] — JSON audit log\n/cancel — скасувати'); return
-    if text=='/new': await start_assessment(chat,user); return
+    if text=='/start':
+        welcome = (
+            'Вітаємо в AI Maturity Bot!\n\n'
+            'AI Maturity Bot — дослідницький інформаційно-аналітичний інструмент '
+            'для комплексного оцінювання AI-зрілості органів публічної влади.\n\n'
+            'Бот дає змогу оцінити готовність органу до використання штучного інтелекту '
+            'за системою показників D1–D8, сформувати профіль AI-зрілості та отримати '
+            'підсумковий аналітичний звіт. В автоматичних режимах аналіз здійснюється '
+            'на основі офіційного вебсайту органу та відкритих джерел.\n\n'
+            'Доступні три режими оцінювання:\n'
+            '🤖 повністю автоматичний ШІ-аналіз;\n'
+            '🤖+👤 ШІ-аналіз з підкріпленням;\n'
+            '👤 ручне оцінювання.\n\n'
+            'Для початку натисніть кнопку «Розпочати оцінювання».\n\n'
+            '© 2026, Антон Осьмак'
+        )
+        keyboard={'keyboard':[[{'text':'▶️ Розпочати оцінювання'}]],'resize_keyboard':True}
+        await send(chat,welcome,keyboard); return
+    if text=='/help':
+        await send(chat,'AI Maturity Bot — v0.3.4\n\n/new — нове оцінювання\n/status — стан\n/log — журнал\n/report [ID] — короткий звіт\n/pdf [ID] — PDF\n/xlsx [ID] — Excel\n/bundle [ID] — пакет\n/drive [ID] — архівувати пакет\n/export [ID] — JSON audit log\n/cancel — скасувати'); return
+    if text in ('/new','▶️ Розпочати оцінювання'): await start_assessment(chat,user); return
     if text=='/cancel':
         with db() as c: a=c.execute("SELECT id FROM assessments WHERE chat_id=? AND status NOT IN ('finished','cancelled') ORDER BY id DESC LIMIT 1",(chat,)).fetchone();
         if a:
@@ -264,12 +320,28 @@ async def handle_message(msg):
         if a['mode']=='manual': await send(chat,f'Орган: {text}\nПочинаємо ручне оцінювання. Шкала 0–5.'); await ask_question(chat,a['id'],0)
         else: await send(chat,'Введіть адресу офіційного вебсайту органу (URL).')
         return
-    with db() as c: a=c.execute("SELECT * FROM assessments WHERE chat_id=? AND status='await_url' ORDER BY id DESC LIMIT 1",(chat,)).fetchone()
+    # URL офіційного сайту. Додатковий fallback робить стан стійким до
+    # рідкісних повторних webhook/update після redeploy: якщо є останнє AI/hybrid
+    # оцінювання з назвою органу, але без URL, адресу все одно приймаємо.
+    with db() as c:
+        a=c.execute("SELECT * FROM assessments WHERE chat_id=? AND status='await_url' ORDER BY id DESC LIMIT 1",(chat,)).fetchone()
+        if not a:
+            a=c.execute("""SELECT * FROM assessments
+                         WHERE chat_id=? AND mode IN ('ai','hybrid')
+                           AND organization IS NOT NULL
+                           AND (official_url IS NULL OR official_url='')
+                           AND status NOT IN ('finished','cancelled')
+                         ORDER BY id DESC LIMIT 1""",(chat,)).fetchone()
     if a:
-        if not re.match(r'^(https?://)?[A-Za-zА-Яа-я0-9.-]+\.[A-Za-zА-Яа-я]{2,}',text): await send(chat,'Введіть коректну адресу офіційного вебсайту, наприклад https://example.gov.ua'); return
-        url=text if text.startswith(('http://','https://')) else 'https://'+text
-        with db() as c:c.execute("UPDATE assessments SET official_url=?,status='ai_processing' WHERE id=?",(url,a['id']))
-        await run_ai_stage(chat,a['id']); return
+        url=normalize_official_url(text)
+        if not url:
+            await send(chat,'Введіть коректну адресу офіційного вебсайту, наприклад https://example.gov.ua або example.gov.ua')
+            return
+        with db() as c:
+            c.execute("UPDATE assessments SET official_url=?,status='ai_processing' WHERE id=?",(url,a['id']))
+        await send(chat,f'Офіційний сайт: {url}')
+        await run_ai_stage(chat,a['id'])
+        return
     with db() as c:a=c.execute("SELECT * FROM assessments WHERE chat_id=? AND status='await_validation_comment' ORDER BY id DESC LIMIT 1",(chat,)).fetchone()
     if a:
         with db() as c:c.execute("UPDATE assessments SET validation_comment=?,status='finished' WHERE id=?",(text[:2000],a['id']))
@@ -280,6 +352,10 @@ async def handle_callback(cb):
     data=cb.get('data',''); chat=cb.get('message',{}).get('chat',{}).get('id');
     if not chat:return
     await tg('answerCallbackQuery',{'callback_query_id':cb['id']}); p=data.split(':')
+    if p[0]=='repeat' and len(p)==2:
+        # Нове незалежне оцінювання; попередній результат залишається в журналі.
+        await start_assessment(chat,cb.get('from',{}))
+        return
     if p[0]=='mode' and len(p)==3:
         aid=int(p[1]); mode=p[2]
         if mode not in MODE_LABEL:return
